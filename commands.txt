@@ -1,0 +1,3 @@
+## airodump-ng for 60 secs and prints out to csv all ESSIDs
+sudo timeout 60 airodump-ng --write scan --output-format csv wlan0mon 2>/dev/null && \
+grep -E "WPA|OPN|WEP" scan-01.csv | sort -t',' -k6 -n | column -t -s ','
