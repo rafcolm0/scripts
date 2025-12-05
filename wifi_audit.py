@@ -48,6 +48,17 @@ from typing import Dict, List, Optional
 
 
 # ---------------------------------------------------------
+# Constants
+# ---------------------------------------------------------
+
+# Important keywords for reaver output filtering
+_IMPORTANT_KEYWORDS = (
+    "[+]", "[!]", "WPS PIN", "WPA PSK", "WARNING",
+    "Failed to associate", "rate limiting", "Detected AP"
+)
+
+
+# ---------------------------------------------------------
 # Data Classes
 # ---------------------------------------------------------
 
@@ -84,6 +95,12 @@ class AttackResult:
 # Helpers
 # ---------------------------------------------------------
 
+# Cache for last known AP count (to handle read errors gracefully)
+_last_known_count = 0
+_last_csv_mtime = 0
+_last_csv_size = 0
+
+
 def check_monitor_mode(interface: str) -> bool:
     """Verify interface is in monitor mode."""
     try:
@@ -98,13 +115,23 @@ def check_monitor_mode(interface: str) -> bool:
 
 def count_aps_in_csv(csv_file: str) -> int:
     """Count number of access points discovered so far in airodump CSV."""
+    global _last_known_count, _last_csv_mtime, _last_csv_size
+
     if not os.path.exists(csv_file):
         return 0
 
-    count = 0
-    last_count = 0
-
     try:
+        # Check if file has been modified
+        stat = os.stat(csv_file)
+        current_mtime = stat.st_mtime
+        current_size = stat.st_size
+
+        # If file unchanged, return cached count
+        if current_mtime == _last_csv_mtime and current_size == _last_csv_size:
+            return _last_known_count
+
+        # File changed, re-parse
+        count = 0
         with open(csv_file, newline="", encoding="utf-8", errors="ignore") as f:
             reader = csv.reader(f)
             in_ap_section = False
@@ -113,33 +140,40 @@ def count_aps_in_csv(csv_file: str) -> int:
                 if not row:
                     continue
 
-                try:
-                    # Find the AP section header
-                    if row[0] == "BSSID":
-                        in_ap_section = True
+                # Find the AP section header
+                if row[0] == "BSSID":
+                    in_ap_section = True
+                    continue
+
+                # Count APs until we hit the Station section
+                if in_ap_section:
+                    # Require at least 14 columns (matches parse_airodump_csv behavior)
+                    if len(row) < 14:
                         continue
 
-                    # Count APs until we hit the Station section
-                    if in_ap_section:
+                    try:
                         bssid = row[0].strip()
 
                         # Stop at Station MAC section
                         if not bssid or bssid == "Station MAC":
                             break
 
-                        # Valid AP entry (just need a valid BSSID)
+                        # Valid AP entry (has valid BSSID)
                         if bssid and ":" in bssid:
                             count += 1
-                except (IndexError, AttributeError):
-                    # Skip malformed rows
-                    continue
+                    except (IndexError, AttributeError):
+                        # Skip malformed rows
+                        continue
 
-            last_count = count
+        # Update cache with successful read
+        _last_known_count = count
+        _last_csv_mtime = current_mtime
+        _last_csv_size = current_size
+        return count
+
     except Exception:
         # If read fails, return last successful count
-        return last_count
-
-    return count
+        return _last_known_count
 
 
 def run_airodump(interface: str, duration: int, prefix: str) -> str:
@@ -454,12 +488,7 @@ def run_reaver_attack(target: AccessPoint, interface: str, result_obj: AttackRes
                     should_print = verbose
 
                     # Always print important lines regardless of verbose mode
-                    important_keywords = [
-                        "[+]", "[!]", "WPS PIN", "WPA PSK", "WARNING",
-                        "Failed to associate", "rate limiting", "Detected AP"
-                    ]
-
-                    if any(keyword in line for keyword in important_keywords):
+                    if any(keyword in line for keyword in _IMPORTANT_KEYWORDS):
                         should_print = True
 
                     if should_print:
