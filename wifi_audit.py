@@ -105,7 +105,7 @@ def run_airodump(interface: str, duration: int, prefix: str) -> str:
     # Run airodump in background (it needs a TTY for display, so we suppress output)
     proc = subprocess.Popen(
         ["sudo", "timeout", str(duration),
-         "airodump-ng", "--write", prefix, "--output-format", "csv", interface],
+         "airodump-ng", "--wps", "--write", prefix, "--output-format", "csv", interface],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL
     )
@@ -158,6 +158,8 @@ def parse_airodump_csv(csv_file: str) -> Dict[str, AccessPoint]:
                     auth = row[7].strip()
                     pwr = row[8].strip()
                     essid = row[13].strip()
+                    # Extract WPS data from column 14 (if available with --wps flag)
+                    wps_status = row[14].strip() if len(row) > 14 else ""
                 except:
                     continue
 
@@ -165,6 +167,21 @@ def parse_airodump_csv(csv_file: str) -> Dict[str, AccessPoint]:
                     break
 
                 pwr = int(pwr) if pwr not in ("", "NA") else -999
+
+                # Parse WPS status from airodump --wps output
+                # Possible values: "WPS" (enabled), "No" (disabled), "Locked"/"Lck" (locked), "" (unknown)
+                if wps_status == "WPS":
+                    wps = "Yes"
+                    locked = "No"
+                elif wps_status in ["Locked", "Lck"]:
+                    wps = "Yes"
+                    locked = "Yes"
+                elif wps_status == "No":
+                    wps = "No"
+                    locked = "No"
+                else:
+                    wps = "?"
+                    locked = "?"
 
                 aps[bssid] = AccessPoint(
                     bssid=bssid,
@@ -174,20 +191,26 @@ def parse_airodump_csv(csv_file: str) -> Dict[str, AccessPoint]:
                     privacy=privacy,
                     cipher=cipher,
                     auth=auth,
+                    wps=wps,
+                    locked=locked,
                 )
 
     return aps
 
 
-def run_wash(interface: str) -> Dict[str, Dict[str, str]]:
+def run_wash(interface: str, duration: int = 120) -> Dict[str, Dict[str, str]]:
     """Run wash and collect WPS + Locked data."""
-    print("[+] Running wash (passive WPS scan)...")
+    print(f"[+] Running wash for {duration} seconds (WPS lock validation)...")
 
     try:
         output = subprocess.check_output(
-            ["wash", "-i", interface],
-            stderr=subprocess.DEVNULL
+            ["timeout", str(duration), "wash", "-i", interface],
+            stderr=subprocess.DEVNULL,
+            timeout=duration + 5  # Python timeout as backup (5s buffer)
         ).decode()
+    except subprocess.TimeoutExpired:
+        print(f"[!] wash timeout after {duration}s")
+        return {}
     except:
         print("[!] wash failed or interface busy.")
         return {}
@@ -590,9 +613,9 @@ def main():
     parser.add_argument(
         "-d", "--duration",
         type=int,
-        default=60,
+        default=120,
         metavar="SEC",
-        help="airodump-ng scan duration in seconds (default: 60)"
+        help="airodump-ng scan duration in seconds (default: 120)"
     )
     parser.add_argument(
         "-o", "--output-prefix",
@@ -625,11 +648,13 @@ def main():
     aps = parse_airodump_csv(csv_file)
     wps_info = run_wash(args.interface)
 
-    # Merge WPS + Locked info
+    # Merge WPS + Locked info (wash overrides airodump for more reliable lock detection)
     for bssid, ap in aps.items():
         if bssid in wps_info:
+            # wash provides more reliable WPS lock detection than airodump
             ap.wps = wps_info[bssid]["wps"]
             ap.locked = wps_info[bssid]["locked"]
+        # If airodump detected WPS but wash didn't find it, keep airodump's values
 
     # Sort strongest first (PWR closer to 0)
     sorted_aps = sorted(aps.values(), key=lambda x: x.pwr, reverse=True)
