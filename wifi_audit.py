@@ -975,17 +975,21 @@ def run_main_logic(args, tui=None):
     csv_file = run_airodump(args.interface, args.airodump_duration, args.output_prefix, tui)
     aps = parse_airodump_csv(csv_file)
 
-    # Use wash-duration if specified, otherwise use same duration as airodump
-    wash_duration = args.wash_duration if args.wash_duration is not None else args.airodump_duration
-    wps_info = run_wash(args.interface, wash_duration, tui)
+    # Run wash if not skipped
+    if not args.skip_wash:
+        # Use wash-duration if specified, otherwise use same duration as airodump
+        wash_duration = args.wash_duration if args.wash_duration is not None else args.airodump_duration
+        wps_info = run_wash(args.interface, wash_duration, tui)
 
-    # Merge WPS + Locked info (wash overrides airodump for more reliable lock detection)
-    for bssid, ap in aps.items():
-        if bssid in wps_info:
-            # wash provides more reliable WPS lock detection than airodump
-            ap.wps = wps_info[bssid]["wps"]
-            ap.locked = wps_info[bssid]["locked"]
-        # If airodump detected WPS but wash didn't find it, keep airodump's values
+        # Merge WPS + Locked info (wash overrides airodump for more reliable lock detection)
+        for bssid, ap in aps.items():
+            if bssid in wps_info:
+                # wash provides more reliable WPS lock detection than airodump
+                ap.wps = wps_info[bssid]["wps"]
+                ap.locked = wps_info[bssid]["locked"]
+            # If airodump detected WPS but wash didn't find it, keep airodump's values
+    else:
+        tui_print("[*] Skipping wash scan, using airodump WPS data only", tui)
 
     # Sort strongest first (PWR closer to 0)
     sorted_aps = sorted(aps.values(), key=lambda x: x.pwr, reverse=True)
@@ -1138,6 +1142,11 @@ def main():
         "--no-curses",
         action="store_true",
         help="disable curses TUI, use legacy scrolling output (for debugging or compatibility)"
+    )
+    parser.add_argument(
+        "--skip-wash",
+        action="store_true",
+        help="skip wash scan, use only airodump WPS detection (faster but less reliable lock detection)"
     )
     args = parser.parse_args()
 
