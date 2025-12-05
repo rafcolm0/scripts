@@ -102,6 +102,8 @@ def count_aps_in_csv(csv_file: str) -> int:
         return 0
 
     count = 0
+    last_count = 0
+
     try:
         with open(csv_file, newline="", encoding="utf-8", errors="ignore") as f:
             reader = csv.reader(f)
@@ -111,26 +113,31 @@ def count_aps_in_csv(csv_file: str) -> int:
                 if not row:
                     continue
 
-                # Find the AP section header
-                if row[0] == "BSSID":
-                    in_ap_section = True
-                    continue
-
-                # Count APs until we hit the Station section
-                if in_ap_section:
-                    if len(row) < 14:
+                try:
+                    # Find the AP section header
+                    if row[0] == "BSSID":
+                        in_ap_section = True
                         continue
 
-                    bssid = row[0].strip()
+                    # Count APs until we hit the Station section
+                    if in_ap_section:
+                        bssid = row[0].strip()
 
-                    # Stop at Station MAC section
-                    if not bssid or bssid == "Station MAC":
-                        break
+                        # Stop at Station MAC section
+                        if not bssid or bssid == "Station MAC":
+                            break
 
-                    # Valid AP entry
-                    count += 1
+                        # Valid AP entry (just need a valid BSSID)
+                        if bssid and ":" in bssid:
+                            count += 1
+                except (IndexError, AttributeError):
+                    # Skip malformed rows
+                    continue
+
+            last_count = count
     except Exception:
-        return 0
+        # If read fails, return last successful count
+        return last_count
 
     return count
 
