@@ -202,15 +202,36 @@ def run_wash(interface: str, duration: int = 120) -> Dict[str, Dict[str, str]]:
     """Run wash and collect WPS + Locked data."""
     print(f"[+] Running wash for {duration} seconds (WPS lock validation)...")
 
+    # Run wash in background
+    proc = subprocess.Popen(
+        ["timeout", str(duration), "wash", "-i", interface],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL
+    )
+
+    # Show progress bar while scanning
+    start = time.time()
+    bar_width = 40
+
+    while proc.poll() is None:
+        elapsed = int(time.time() - start)
+        progress = min(elapsed / duration, 1)
+        filled = int(bar_width * progress)
+        bar = "█" * filled + "░" * (bar_width - filled)
+        percent = int(progress * 100)
+        print(f"\r[WASH] |{bar}| {percent}% ({elapsed}/{duration}s)", end="", flush=True)
+
+        if elapsed >= duration:
+            break
+        time.sleep(0.5)
+
+    proc.wait()
+    print()  # New line after progress bar
+
+    # Get the output
     try:
-        output = subprocess.check_output(
-            ["timeout", str(duration), "wash", "-i", interface],
-            stderr=subprocess.DEVNULL,
-            timeout=duration + 5  # Python timeout as backup (5s buffer)
-        ).decode()
-    except subprocess.TimeoutExpired:
-        print(f"[!] wash timeout after {duration}s")
-        return {}
+        output, _ = proc.communicate(timeout=5)
+        output = output.decode()
     except:
         print("[!] wash failed or interface busy.")
         return {}
@@ -611,11 +632,18 @@ def main():
         help="wireless interface in monitor mode (required)"
     )
     parser.add_argument(
-        "-d", "--duration",
+        "-a", "--airodump-duration",
         type=int,
-        default=120,
+        default=480,
         metavar="SEC",
-        help="airodump-ng scan duration in seconds (default: 120)"
+        help="airodump-ng scan duration in seconds (default: 480)"
+    )
+    parser.add_argument(
+        "-w", "--wash-duration",
+        type=int,
+        default=None,
+        metavar="SEC",
+        help="wash scan duration in seconds (default: same as airodump duration)"
     )
     parser.add_argument(
         "-o", "--output-prefix",
@@ -644,9 +672,12 @@ def main():
     print(f"[+] Interface {args.interface} is in monitor mode")
 
     # Run airodump scan
-    csv_file = run_airodump(args.interface, args.duration, args.output_prefix)
+    csv_file = run_airodump(args.interface, args.airodump_duration, args.output_prefix)
     aps = parse_airodump_csv(csv_file)
-    wps_info = run_wash(args.interface)
+
+    # Use wash-duration if specified, otherwise use same duration as airodump
+    wash_duration = args.wash_duration if args.wash_duration is not None else args.airodump_duration
+    wps_info = run_wash(args.interface, wash_duration)
 
     # Merge WPS + Locked info (wash overrides airodump for more reliable lock detection)
     for bssid, ap in aps.items():
