@@ -134,6 +134,18 @@ class WifiAuditTUI:
             return
         self.output_buffer.append(line)
 
+    def update_progress_line(self, line: str, tag: str = "[SCAN]"):
+        """Update the last line if it's a progress message, otherwise append."""
+        if not self.enabled:
+            print(f"\r{line}", end="", flush=True)
+            return
+
+        # If last line starts with the same tag, replace it
+        if self.output_buffer and self.output_buffer[-1].startswith(tag):
+            self.output_buffer[-1] = line
+        else:
+            self.output_buffer.append(line)
+
     def get_color_for_line(self, line: str) -> int:
         """Determine color pair based on line content."""
         if "[+]" in line or "SUCCESS" in line:
@@ -257,7 +269,7 @@ class WifiAuditTUI:
             self.stdscr.addstr(y, 0, separator)
             y += 1
 
-            header = "=== Live Reaver Output (Last 50 lines) ==="
+            header = "=== Live Audit Output (Last 50 lines) ==="
             self.stdscr.addstr(y, 0, header.ljust(max_x - 1), curses.A_BOLD)
             y += 1
 
@@ -428,7 +440,10 @@ def run_airodump(interface: str, duration: int, prefix: str, tui=None) -> str:
 
         msg = f"[SCAN] |{bar}| {percent}% ({elapsed}/{duration}s) | SSIDs: {ssid_count}"
         if tui and tui.enabled:
-            tui.add_output_line(msg)
+            tui.update_progress_line(msg, "[SCAN]")
+            # Refresh display to show progress during scan
+            dummy_stats = {'total': 0, 'completed': 0, 'success': 0, 'failed': 0, 'locked': 0}
+            tui.refresh_display([], dummy_stats)
         else:
             print(f"\r{msg}", end="", flush=True)
 
@@ -536,7 +551,10 @@ def run_wash(interface: str, duration: int = 120, tui=None) -> Dict[str, Dict[st
 
         msg = f"[WASH] |{bar}| {percent}% ({elapsed}/{duration}s)"
         if tui and tui.enabled:
-            tui.add_output_line(msg)
+            tui.update_progress_line(msg, "[WASH]")
+            # Refresh display to show progress during scan
+            dummy_stats = {'total': 0, 'completed': 0, 'success': 0, 'failed': 0, 'locked': 0}
+            tui.refresh_display([], dummy_stats)
         else:
             print(f"\r{msg}", end="", flush=True)
 
@@ -683,7 +701,7 @@ def update_targets_table(results: List[AttackResult], stats: Dict, tui=None):
         print(f"{num:<3} | {essid:<20} | {bssid:<17} | {session:<12} | {progress:<55}")
 
     print("=" * 120)
-    print("\n=== Live Reaver Output ===\n")
+    print("\n=== Live Audit Output ===\n")
 
 
 def run_reaver_attack(target: AccessPoint, interface: str, result_obj: AttackResult,
