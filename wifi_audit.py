@@ -96,6 +96,45 @@ def check_monitor_mode(interface: str) -> bool:
         return False
 
 
+def count_aps_in_csv(csv_file: str) -> int:
+    """Count number of access points discovered so far in airodump CSV."""
+    if not os.path.exists(csv_file):
+        return 0
+
+    count = 0
+    try:
+        with open(csv_file, newline="", encoding="utf-8", errors="ignore") as f:
+            reader = csv.reader(f)
+            in_ap_section = False
+
+            for row in reader:
+                if not row:
+                    continue
+
+                # Find the AP section header
+                if row[0] == "BSSID":
+                    in_ap_section = True
+                    continue
+
+                # Count APs until we hit the Station section
+                if in_ap_section:
+                    if len(row) < 14:
+                        continue
+
+                    bssid = row[0].strip()
+
+                    # Stop at Station MAC section
+                    if not bssid or bssid == "Station MAC":
+                        break
+
+                    # Valid AP entry
+                    count += 1
+    except Exception:
+        return 0
+
+    return count
+
+
 def run_airodump(interface: str, duration: int, prefix: str) -> str:
     """Run airodump-ng for `duration` sec and save CSV."""
     csv_path = f"{prefix}-01.csv"
@@ -119,7 +158,11 @@ def run_airodump(interface: str, duration: int, prefix: str) -> str:
         filled = int(bar_width * progress)
         bar = "█" * filled + "░" * (bar_width - filled)
         percent = int(progress * 100)
-        print(f"\r[SCAN] |{bar}| {percent}% ({elapsed}/{duration}s)", end="", flush=True)
+
+        # Count SSIDs discovered so far
+        ssid_count = count_aps_in_csv(csv_path)
+
+        print(f"\r[SCAN] |{bar}| {percent}% ({elapsed}/{duration}s) | SSIDs: {ssid_count}", end="", flush=True)
 
         if elapsed >= duration:
             break
