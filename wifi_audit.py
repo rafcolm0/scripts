@@ -315,8 +315,13 @@ class WifiAuditTUI:
             # Refresh screen
             self.stdscr.refresh()
 
-        except curses.error:
-            pass
+        except curses.error as e:
+            # Log curses errors - screen might be too small
+            self.enabled = False
+            raise Exception(f"Curses error in refresh_display: {e}. Terminal might be too small.")
+        except Exception as e:
+            self.enabled = False
+            raise
 
     def print(self, message: str):
         """Print a message (adds to output buffer and refreshes)."""
@@ -627,7 +632,8 @@ def wait_with_countdown(seconds: int, reason: str = "WPS lock detected", tui=Non
         mins, secs = divmod(remaining, 60)
         msg = f"[WAIT] {mins:02d}:{secs:02d} remaining..."
         if tui and tui.enabled:
-            tui.add_output_line(msg)
+            # Use update_progress_line instead of add_output_line to avoid filling buffer
+            tui.update_progress_line(msg, "[WAIT]")
             time.sleep(1)
         else:
             print(f"\r{msg}", end="", flush=True)
