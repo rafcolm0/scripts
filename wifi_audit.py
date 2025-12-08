@@ -458,6 +458,10 @@ def run_airodump(interface: str, duration: int, prefix: str, tui=None) -> str:
 
     proc.wait()
 
+    # Log if airodump exited with error (ignore timeout signal -9/124)
+    if proc.returncode and proc.returncode not in (0, -9, 124):
+        tui_print(f"[!] airodump-ng exited with code {proc.returncode}", tui)
+
     if not (tui and tui.enabled):
         print()  # Newline for legacy mode
     tui_print("[+] Finished airodump scan.", tui)
@@ -569,6 +573,10 @@ def run_wash(interface: str, duration: int = 120, tui=None) -> Dict[str, Dict[st
 
     proc.wait()
 
+    # Log if wash exited with error (ignore timeout signal -9/124)
+    if proc.returncode and proc.returncode not in (0, -9, 124):
+        tui_print(f"[!] wash exited with code {proc.returncode}", tui)
+
     if not (tui and tui.enabled):
         print()  # New line after progress bar for legacy mode
 
@@ -622,7 +630,7 @@ def tui_print(message: str, tui=None):
         print(message)
 
 
-def wait_with_countdown(seconds: int, reason: str = "WPS lock detected", tui=None):
+def wait_with_countdown(seconds: int, reason: str = "WPS lock detected", tui=None, results=None, stats=None):
     """Display countdown timer."""
     tui_print(f"\n[!] {reason}, waiting {seconds // 60} minutes...", tui)
     end_time = time.time() + seconds
@@ -634,6 +642,9 @@ def wait_with_countdown(seconds: int, reason: str = "WPS lock detected", tui=Non
         if tui and tui.enabled:
             # Use update_progress_line instead of add_output_line to avoid filling buffer
             tui.update_progress_line(msg, "[WAIT]")
+            # Refresh display to show countdown
+            if results is not None and stats is not None:
+                tui.refresh_display(results, stats)
             time.sleep(1)
         else:
             print(f"\r{msg}", end="", flush=True)
@@ -832,6 +843,10 @@ def run_reaver_attack(target: AccessPoint, interface: str, result_obj: AttackRes
 
             proc.wait()
 
+            # Log if reaver exited with error
+            if proc.returncode and proc.returncode not in (0, -9, -15):  # -9=SIGKILL, -15=SIGTERM
+                tui_print(f"[!] reaver exited with code {proc.returncode}", tui)
+
             # Check if we succeeded
             if wps_pin:
                 elapsed = time.time() - start_time
@@ -858,7 +873,7 @@ def run_reaver_attack(target: AccessPoint, interface: str, result_obj: AttackRes
             if locked:
                 retry_count += 1
                 if retry_count <= max_retries:
-                    wait_with_countdown(300, "WPS lock detected", tui)  # 5 minutes
+                    wait_with_countdown(300, "WPS lock detected", tui, all_results, stats)  # 5 minutes
                     use_no_association = True  # Reset to no-association for retry
                 else:
                     tui_print(f"[!] Max retries ({max_retries}) reached, target locked", tui)
