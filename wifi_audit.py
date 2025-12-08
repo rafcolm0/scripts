@@ -197,14 +197,9 @@ class WifiAuditTUI:
         self.output_buffer = deque(maxlen=50)  # Keep last 50 lines
         self.enabled = True
 
-        # Scroll state for output window
-        self.scroll_offset = 0  # 0 = viewing most recent (bottom), positive = scrolled up
-        self.auto_scroll = True  # Auto-scroll to bottom on new output
-
         # Scan phase state for live table display
         self.scan_results = []  # Store discovered APs during scan phase
         self.scan_phase = True  # True during airodump/wash, False during attacks
-        self.scan_scroll_offset = 0  # Scroll offset for scan table
 
         # Initialize curses colors
         try:
@@ -234,8 +229,6 @@ class WifiAuditTUI:
             print(line)
             return
         self.output_buffer.append(line)
-        if self.auto_scroll:
-            self.scroll_offset = 0  # Stay at bottom when auto-scrolling
 
     def update_progress_line(self, line: str, tag: str = "[SCAN]"):
         """Update the last line if it's a progress message, otherwise append."""
@@ -248,81 +241,6 @@ class WifiAuditTUI:
             self.output_buffer[-1] = line
         else:
             self.output_buffer.append(line)
-
-    def get_output_window_height(self):
-        """Get the number of lines available for output display."""
-        try:
-            max_y, _ = self.stdscr.getmaxyx()
-            # Estimate: header(3) + table(varies) + output_header(3) + margin(1)
-            return max(5, max_y - 20)
-        except:
-            return 10
-
-    def handle_input(self):
-        """Handle keyboard input for scrolling. Returns True if input was handled."""
-        if not self.enabled:
-            return False
-
-        try:
-            key = self.stdscr.getch()
-            if key == -1:  # No input
-                return False
-
-            # During scan phase, scroll the scan table
-            if self.scan_phase and self.scan_results:
-                max_scroll = max(0, len(self.scan_results) - self.get_scan_table_height())
-
-                if key == curses.KEY_UP or key == ord('k'):
-                    self.scan_scroll_offset = max(self.scan_scroll_offset - 1, 0)
-                    return True
-                elif key == curses.KEY_DOWN or key == ord('j'):
-                    self.scan_scroll_offset = min(self.scan_scroll_offset + 1, max_scroll)
-                    return True
-                elif key == curses.KEY_PPAGE:  # Page Up
-                    self.scan_scroll_offset = max(self.scan_scroll_offset - 10, 0)
-                    return True
-                elif key == curses.KEY_NPAGE:  # Page Down
-                    self.scan_scroll_offset = min(self.scan_scroll_offset + 10, max_scroll)
-                    return True
-                elif key == curses.KEY_HOME:
-                    self.scan_scroll_offset = 0
-                    return True
-                elif key == curses.KEY_END:
-                    self.scan_scroll_offset = max_scroll
-                    return True
-            else:
-                # During attack phase, scroll the output window
-                max_scroll = max(0, len(self.output_buffer) - self.get_output_window_height())
-
-                if key == curses.KEY_UP or key == ord('k'):
-                    self.scroll_offset = min(self.scroll_offset + 1, max_scroll)
-                    self.auto_scroll = False
-                    return True
-                elif key == curses.KEY_DOWN or key == ord('j'):
-                    self.scroll_offset = max(self.scroll_offset - 1, 0)
-                    if self.scroll_offset == 0:
-                        self.auto_scroll = True
-                    return True
-                elif key == curses.KEY_PPAGE:  # Page Up
-                    self.scroll_offset = min(self.scroll_offset + 10, max_scroll)
-                    self.auto_scroll = False
-                    return True
-                elif key == curses.KEY_NPAGE:  # Page Down
-                    self.scroll_offset = max(self.scroll_offset - 10, 0)
-                    if self.scroll_offset == 0:
-                        self.auto_scroll = True
-                    return True
-                elif key == curses.KEY_HOME:
-                    self.scroll_offset = max_scroll
-                    self.auto_scroll = False
-                    return True
-                elif key == curses.KEY_END:
-                    self.scroll_offset = 0
-                    self.auto_scroll = True
-                    return True
-        except:
-            pass
-        return False
 
     def get_color_for_line(self, line: str) -> int:
         """Determine color pair based on line content."""
@@ -436,15 +354,6 @@ class WifiAuditTUI:
 
         return y
 
-    def get_scan_table_height(self):
-        """Get the number of rows available for scan table display."""
-        try:
-            max_y, _ = self.stdscr.getmaxyx()
-            # Reserve: header(3) + table_header(2) + output_window(12)
-            return max(5, max_y - 17)
-        except:
-            return 10
-
     def draw_scan_table(self, y_offset: int) -> int:
         """Draw discovered WPS-enabled networks during scan phase. Returns next y position."""
         max_y, max_x = self.stdscr.getmaxyx()
@@ -456,22 +365,11 @@ class WifiAuditTUI:
         total_wps = len(wps_aps)
 
         try:
-            # Calculate available rows and scroll bounds
+            # Calculate available rows
             available_rows = max_y - y - 12  # Reserve space for output window
-            max_scroll = max(0, total_wps - available_rows)
 
-            # Clamp scroll offset to valid range
-            self.scan_scroll_offset = max(0, min(self.scan_scroll_offset, max_scroll))
-
-            # Calculate display range
-            start_idx = self.scan_scroll_offset
-            end_idx = start_idx + available_rows
-
-            # Table header with scroll indicator (show WPS targets only)
-            if self.scan_scroll_offset > 0 or total_wps > available_rows:
-                header = f"{'#':<3} | {'ESSID':<20} | {'BSSID':<17} | {'CH':<3} | {'PWR':<4} | {'ENC':<8} | {'WPS':<5} [WPS: {start_idx+1}-{min(end_idx, total_wps)}/{total_wps}]"
-            else:
-                header = f"{'#':<3} | {'ESSID':<20} | {'BSSID':<17} | {'CH':<3} | {'PWR':<4} | {'ENC':<8} | {'WPS':<5} [WPS targets: {total_wps}]"
+            # Table header
+            header = f"{'#':<3} | {'ESSID':<20} | {'BSSID':<17} | {'CH':<3} | {'PWR':<4} | {'ENC':<8} | {'WPS':<5} [WPS targets: {total_wps}]"
             self.stdscr.addstr(y, 0, header[:max_x - 1], curses.A_BOLD)
             y += 1
 
@@ -479,10 +377,9 @@ class WifiAuditTUI:
             self.stdscr.addstr(y, 0, separator)
             y += 1
 
-            # Show rows with scroll offset applied (WPS networks only)
-            for idx, ap in enumerate(wps_aps[start_idx:end_idx]):
-                actual_idx = start_idx + idx
-                num = f"{actual_idx + 1}"
+            # Show rows (as many as fit)
+            for idx, ap in enumerate(wps_aps[:available_rows]):
+                num = f"{idx + 1}"
 
                 # Show placeholder for hidden networks
                 essid = ap.get('essid', '').strip()
@@ -497,12 +394,10 @@ class WifiAuditTUI:
                 wps = ap.get('wps', '?')[:5]
 
                 # Color based on WPS status
-                # WPS version (1.0, 2.0) or "WPS" = enabled (green)
-                # "Locked" or "Lck" = locked (yellow)
                 if wps in ('Locked', 'Lck'):
                     color = curses.color_pair(3)  # Yellow - WPS locked
                 elif wps and wps not in ('No', '?', ''):
-                    color = curses.color_pair(1)  # Green - WPS enabled (version or "WPS")
+                    color = curses.color_pair(1)  # Green - WPS enabled
                 else:
                     color = 0
 
@@ -519,7 +414,7 @@ class WifiAuditTUI:
         return y
 
     def draw_output_window(self, y_offset: int):
-        """Draw the live output window with scroll support."""
+        """Draw the live output window (shows most recent lines)."""
         max_y, max_x = self.stdscr.getmaxyx()
 
         try:
@@ -529,11 +424,7 @@ class WifiAuditTUI:
             self.stdscr.addstr(y, 0, separator)
             y += 1
 
-            # Show scroll indicator in header if scrolled
-            if self.scroll_offset > 0:
-                header = f"=== Live Audit Output (Scrolled: +{self.scroll_offset} lines, ↓/j=newer) ==="
-            else:
-                header = "=== Live Audit Output (↑/k=scroll, Last 50 lines) ==="
+            header = "=== Live Audit Output ==="
             self.stdscr.addstr(y, 0, header.ljust(max_x - 1), curses.A_BOLD)
             y += 1
 
@@ -541,26 +432,21 @@ class WifiAuditTUI:
             self.stdscr.addstr(y, 0, separator)
             y += 1
 
-            # Draw output lines with scroll offset
+            # Draw output lines (most recent that fit)
             available_lines = max_y - y - 1
             total_lines = len(self.output_buffer)
 
-            # Calculate which lines to show based on scroll offset
+            # Show most recent lines
             if total_lines <= available_lines:
-                # All lines fit, no scrolling needed
                 lines_to_show = list(self.output_buffer)
             else:
-                # Apply scroll offset (scroll_offset=0 means show most recent)
-                end_idx = total_lines - self.scroll_offset
-                start_idx = max(0, end_idx - available_lines)
-                lines_to_show = list(self.output_buffer)[start_idx:end_idx]
+                lines_to_show = list(self.output_buffer)[-available_lines:]
 
             for line in lines_to_show:
                 if y >= max_y - 1:
                     break
 
                 color = self.get_color_for_line(line)
-                # Truncate line to fit screen width
                 display_line = line[:max_x - 1]
                 self.stdscr.addstr(y, 0, display_line, color)
                 y += 1
@@ -572,9 +458,6 @@ class WifiAuditTUI:
         """Refresh the entire display."""
         if not self.enabled:
             return
-
-        # Handle any pending keyboard input for scrolling
-        self.handle_input()
 
         try:
             # Clear screen
