@@ -202,6 +202,7 @@ class WifiAuditTUI:
         # Scan phase state for live table display
         self.scan_results = []  # Store discovered APs during scan phase
         self.scan_phase = True  # True during airodump/wash, False during attacks
+        self.scan_scroll_offset = 0  # Scroll offset for scan table
 
         # Initialize curses colors
         try:
@@ -265,34 +266,58 @@ class WifiAuditTUI:
             if key == -1:  # No input
                 return False
 
-            max_scroll = max(0, len(self.output_buffer) - self.get_output_window_height())
+            # During scan phase, scroll the scan table
+            if self.scan_phase and self.scan_results:
+                max_scroll = max(0, len(self.scan_results) - self.get_scan_table_height())
 
-            if key == curses.KEY_UP or key == ord('k'):
-                self.scroll_offset = min(self.scroll_offset + 1, max_scroll)
-                self.auto_scroll = False
-                return True
-            elif key == curses.KEY_DOWN or key == ord('j'):
-                self.scroll_offset = max(self.scroll_offset - 1, 0)
-                if self.scroll_offset == 0:
+                if key == curses.KEY_UP or key == ord('k'):
+                    self.scan_scroll_offset = max(self.scan_scroll_offset - 1, 0)
+                    return True
+                elif key == curses.KEY_DOWN or key == ord('j'):
+                    self.scan_scroll_offset = min(self.scan_scroll_offset + 1, max_scroll)
+                    return True
+                elif key == curses.KEY_PPAGE:  # Page Up
+                    self.scan_scroll_offset = max(self.scan_scroll_offset - 10, 0)
+                    return True
+                elif key == curses.KEY_NPAGE:  # Page Down
+                    self.scan_scroll_offset = min(self.scan_scroll_offset + 10, max_scroll)
+                    return True
+                elif key == curses.KEY_HOME:
+                    self.scan_scroll_offset = 0
+                    return True
+                elif key == curses.KEY_END:
+                    self.scan_scroll_offset = max_scroll
+                    return True
+            else:
+                # During attack phase, scroll the output window
+                max_scroll = max(0, len(self.output_buffer) - self.get_output_window_height())
+
+                if key == curses.KEY_UP or key == ord('k'):
+                    self.scroll_offset = min(self.scroll_offset + 1, max_scroll)
+                    self.auto_scroll = False
+                    return True
+                elif key == curses.KEY_DOWN or key == ord('j'):
+                    self.scroll_offset = max(self.scroll_offset - 1, 0)
+                    if self.scroll_offset == 0:
+                        self.auto_scroll = True
+                    return True
+                elif key == curses.KEY_PPAGE:  # Page Up
+                    self.scroll_offset = min(self.scroll_offset + 10, max_scroll)
+                    self.auto_scroll = False
+                    return True
+                elif key == curses.KEY_NPAGE:  # Page Down
+                    self.scroll_offset = max(self.scroll_offset - 10, 0)
+                    if self.scroll_offset == 0:
+                        self.auto_scroll = True
+                    return True
+                elif key == curses.KEY_HOME:
+                    self.scroll_offset = max_scroll
+                    self.auto_scroll = False
+                    return True
+                elif key == curses.KEY_END:
+                    self.scroll_offset = 0
                     self.auto_scroll = True
-                return True
-            elif key == curses.KEY_PPAGE:  # Page Up
-                self.scroll_offset = min(self.scroll_offset + 10, max_scroll)
-                self.auto_scroll = False
-                return True
-            elif key == curses.KEY_NPAGE:  # Page Down
-                self.scroll_offset = max(self.scroll_offset - 10, 0)
-                if self.scroll_offset == 0:
-                    self.auto_scroll = True
-                return True
-            elif key == curses.KEY_HOME:
-                self.scroll_offset = max_scroll
-                self.auto_scroll = False
-                return True
-            elif key == curses.KEY_END:
-                self.scroll_offset = 0
-                self.auto_scroll = True
-                return True
+                    return True
         except:
             pass
         return False
@@ -409,14 +434,41 @@ class WifiAuditTUI:
 
         return y
 
+    def get_scan_table_height(self):
+        """Get the number of rows available for scan table display."""
+        try:
+            max_y, _ = self.stdscr.getmaxyx()
+            # Reserve: header(3) + table_header(2) + output_window(12)
+            return max(5, max_y - 17)
+        except:
+            return 10
+
     def draw_scan_table(self, y_offset: int) -> int:
-        """Draw discovered networks during scan phase. Returns next y position."""
+        """Draw discovered WPS-enabled networks during scan phase. Returns next y position."""
         max_y, max_x = self.stdscr.getmaxyx()
         y = y_offset
 
+        # Filter for WPS-enabled or possibly WPS-enabled networks (exclude confirmed "No")
+        wps_aps = [ap for ap in self.scan_results if ap.get('wps', '?') not in ('No', '')]
+        total_wps = len(wps_aps)
+
         try:
-            # Table header
-            header = f"{'#':<3} | {'ESSID':<20} | {'BSSID':<17} | {'CH':<3} | {'PWR':<4} | {'ENC':<8} | {'WPS':<5}"
+            # Calculate available rows and scroll bounds
+            available_rows = max_y - y - 12  # Reserve space for output window
+            max_scroll = max(0, total_wps - available_rows)
+
+            # Clamp scroll offset to valid range
+            self.scan_scroll_offset = max(0, min(self.scan_scroll_offset, max_scroll))
+
+            # Calculate display range
+            start_idx = self.scan_scroll_offset
+            end_idx = start_idx + available_rows
+
+            # Table header with scroll indicator (show WPS targets only)
+            if self.scan_scroll_offset > 0 or total_wps > available_rows:
+                header = f"{'#':<3} | {'ESSID':<20} | {'BSSID':<17} | {'CH':<3} | {'PWR':<4} | {'ENC':<8} | {'WPS':<5} [WPS: {start_idx+1}-{min(end_idx, total_wps)}/{total_wps}]"
+            else:
+                header = f"{'#':<3} | {'ESSID':<20} | {'BSSID':<17} | {'CH':<3} | {'PWR':<4} | {'ENC':<8} | {'WPS':<5} [WPS targets: {total_wps}]"
             self.stdscr.addstr(y, 0, header[:max_x - 1], curses.A_BOLD)
             y += 1
 
@@ -424,11 +476,17 @@ class WifiAuditTUI:
             self.stdscr.addstr(y, 0, separator)
             y += 1
 
-            # Show as many rows as fit
-            available_rows = max_y - y - 12  # Reserve space for output window
-            for idx, ap in enumerate(self.scan_results[:available_rows]):
-                num = f"{idx + 1}"
-                essid = ap.get('essid', '')[:20]
+            # Show rows with scroll offset applied (WPS networks only)
+            for idx, ap in enumerate(wps_aps[start_idx:end_idx]):
+                actual_idx = start_idx + idx
+                num = f"{actual_idx + 1}"
+
+                # Show placeholder for hidden networks
+                essid = ap.get('essid', '').strip()
+                if not essid:
+                    essid = '<< Hidden ESSID >>'
+                essid = essid[:20]
+
                 bssid = ap.get('bssid', '')
                 channel = ap.get('channel', '')[:3]
                 pwr = str(ap.get('pwr', ''))[:4]
