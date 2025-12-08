@@ -149,7 +149,9 @@ def parse_csv_cached(csv_file: str) -> tuple:
                     if ":" in bssid:
                         count += 1
                         wps_status = row[14].strip() if len(row) > 14 and row[14] else ""
-                        if wps_status in ("WPS", "Locked", "Lck"):
+                        # WPS can be: version number (1.0, 2.0), "WPS", "Locked", "Lck"
+                        # Any non-empty value except explicit "No" indicates WPS enabled
+                        if wps_status and wps_status not in ("No", ""):
                             wps_count += 1
 
                         aps.append({
@@ -449,7 +451,8 @@ class WifiAuditTUI:
         y = y_offset
 
         # Filter for confirmed WPS-enabled networks only
-        wps_aps = [ap for ap in self.scan_results if ap.get('wps', '') in ('WPS', 'Locked', 'Lck')]
+        # WPS can be: version (1.0, 2.0), "WPS", "Locked", "Lck" - anything non-empty except "No" or "?"
+        wps_aps = [ap for ap in self.scan_results if ap.get('wps', '') and ap.get('wps', '') not in ('No', '?', '')]
         total_wps = len(wps_aps)
 
         try:
@@ -494,10 +497,12 @@ class WifiAuditTUI:
                 wps = ap.get('wps', '?')[:5]
 
                 # Color based on WPS status
-                if wps in ('WPS', 'Yes'):
-                    color = curses.color_pair(1)  # Green - WPS enabled
-                elif wps in ('Locked', 'Lck'):
+                # WPS version (1.0, 2.0) or "WPS" = enabled (green)
+                # "Locked" or "Lck" = locked (yellow)
+                if wps in ('Locked', 'Lck'):
                     color = curses.color_pair(3)  # Yellow - WPS locked
+                elif wps and wps not in ('No', '?', ''):
+                    color = curses.color_pair(1)  # Green - WPS enabled (version or "WPS")
                 else:
                     color = 0
 
@@ -713,15 +718,16 @@ def parse_airodump_csv(csv_file: str) -> Dict[str, AccessPoint]:
                 pwr = int(pwr) if pwr not in ("", "NA") else -999
 
                 # Parse WPS status from airodump --wps output
-                # Possible values: "WPS" (enabled), "No" (disabled), "Locked"/"Lck" (locked), "" (unknown)
-                if wps_status == "WPS":
-                    wps = "Yes"
-                    locked = "No"
-                elif wps_status in ["Locked", "Lck"]:
+                # Possible values: version (1.0, 2.0), "Locked"/"Lck" (locked), "No" (disabled), "" (unknown)
+                if wps_status in ["Locked", "Lck"]:
                     wps = "Yes"
                     locked = "Yes"
-                elif wps_status == "No":
-                    wps = "No"
+                elif wps_status == "No" or wps_status == "":
+                    wps = "No" if wps_status == "No" else "?"
+                    locked = "No" if wps_status == "No" else "?"
+                elif wps_status:
+                    # Any other value (1.0, 2.0, "WPS", etc.) means WPS is enabled
+                    wps = "Yes"
                     locked = "No"
                 else:
                     wps = "?"
@@ -781,6 +787,17 @@ def run_wash(interface: str, duration: int = 120, tui=None) -> Dict[str, Dict[st
                     # Count if it's a valid WPS line (has BSSID in first 17 chars)
                     if len(decoded_line) > 17 and ":" in decoded_line[:17]:
                         wps_found += 1
+                        # Update scan_results with confirmed WPS status
+                        bssid = decoded_line[:17].strip()
+                        if tui and tui.enabled and tui.scan_results:
+                            for ap in tui.scan_results:
+                                if ap.get('bssid', '').upper() == bssid.upper():
+                                    # Check if locked (Lck column or Yes in lock column)
+                                    if 'Lck' in decoded_line or 'Yes' in decoded_line:
+                                        ap['wps'] = 'Locked'
+                                    else:
+                                        ap['wps'] = 'WPS'
+                                    break
         except:
             pass
 
@@ -805,6 +822,16 @@ def run_wash(interface: str, duration: int = 120, tui=None) -> Dict[str, Dict[st
                 output_lines.append(line)
                 if len(line) > 17 and ":" in line[:17]:
                     wps_found += 1
+                    # Update scan_results with confirmed WPS status
+                    bssid = line[:17].strip()
+                    if tui and tui.enabled and tui.scan_results:
+                        for ap in tui.scan_results:
+                            if ap.get('bssid', '').upper() == bssid.upper():
+                                if 'Lck' in line or 'Yes' in line:
+                                    ap['wps'] = 'Locked'
+                                else:
+                                    ap['wps'] = 'WPS'
+                                break
     except:
         pass
 
