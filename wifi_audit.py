@@ -448,8 +448,8 @@ class WifiAuditTUI:
         max_y, max_x = self.stdscr.getmaxyx()
         y = y_offset
 
-        # Filter for WPS-enabled or possibly WPS-enabled networks (exclude confirmed "No")
-        wps_aps = [ap for ap in self.scan_results if ap.get('wps', '?') not in ('No', '')]
+        # Filter for confirmed WPS-enabled networks only
+        wps_aps = [ap for ap in self.scan_results if ap.get('wps', '') in ('WPS', 'Locked', 'Lck')]
         total_wps = len(wps_aps)
 
         try:
