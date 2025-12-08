@@ -45,8 +45,8 @@ import re
 import curses
 from collections import deque
 from datetime import datetime
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from dataclasses import dataclass
+from typing import Dict, List
 
 
 # ---------------------------------------------------------
@@ -94,6 +94,96 @@ class AttackResult:
 
 
 # ---------------------------------------------------------
+# CSV Parsing Cache (shared by TUI and helpers)
+# ---------------------------------------------------------
+
+class CSVCache:
+    """Cache for airodump CSV parsing to avoid redundant file reads."""
+    __slots__ = ('mtime', 'size', 'count', 'wps_count', 'aps')
+
+    def __init__(self):
+        self.mtime = 0
+        self.size = 0
+        self.count = 0
+        self.wps_count = 0
+        self.aps = []
+
+_csv_cache = CSVCache()
+
+
+def parse_csv_cached(csv_file: str) -> tuple:
+    """Parse airodump CSV with caching. Returns (total_count, wps_count, aps_list).
+    Uses file mtime/size to avoid re-parsing unchanged files."""
+    global _csv_cache
+
+    if not os.path.exists(csv_file):
+        return (0, 0, [])
+
+    try:
+        stat = os.stat(csv_file)
+        if stat.st_mtime == _csv_cache.mtime and stat.st_size == _csv_cache.size:
+            return (_csv_cache.count, _csv_cache.wps_count, _csv_cache.aps)
+
+        # File changed, re-parse
+        count = 0
+        wps_count = 0
+        aps = []
+
+        with open(csv_file, newline="", encoding="utf-8", errors="ignore") as f:
+            reader = csv.reader(f)
+            in_ap_section = False
+
+            for row in reader:
+                if not row:
+                    continue
+
+                if row[0] == "BSSID":
+                    in_ap_section = True
+                    continue
+
+                if in_ap_section:
+                    bssid = row[0].strip() if row else ""
+                    if not bssid or bssid == "Station MAC":
+                        break
+
+                    if ":" in bssid:
+                        count += 1
+                        wps_status = row[14].strip() if len(row) > 14 and row[14] else ""
+                        if wps_status in ("WPS", "Locked", "Lck"):
+                            wps_count += 1
+
+                        aps.append({
+                            'bssid': bssid,
+                            'channel': row[3].strip() if len(row) > 3 else '',
+                            'privacy': row[5].strip() if len(row) > 5 else '',
+                            'pwr': row[8].strip() if len(row) > 8 else '',
+                            'essid': row[13].strip() if len(row) > 13 else '',
+                            'wps': wps_status or '?',
+                        })
+
+        # Sort by signal strength (PWR closer to 0 is stronger)
+        aps.sort(key=lambda x: int(x['pwr']) if x['pwr'].lstrip('-').isdigit() else -999, reverse=True)
+
+        # Update cache
+        _csv_cache.mtime = stat.st_mtime
+        _csv_cache.size = stat.st_size
+        _csv_cache.count = count
+        _csv_cache.wps_count = wps_count
+        _csv_cache.aps = aps
+
+        return (count, wps_count, aps)
+
+    except Exception:
+        return (_csv_cache.count, _csv_cache.wps_count, _csv_cache.aps)
+
+
+def count_aps_in_csv(csv_file: str) -> tuple:
+    """Count APs in airodump CSV. Returns (total_count, wps_count)."""
+    count, wps_count, _ = parse_csv_cached(csv_file)
+    return (count, wps_count)
+
+
+# ---------------------------------------------------------
 # TUI Manager
 # ---------------------------------------------------------
 
@@ -104,6 +194,14 @@ class WifiAuditTUI:
         self.stdscr = stdscr
         self.output_buffer = deque(maxlen=50)  # Keep last 50 lines
         self.enabled = True
+
+        # Scroll state for output window
+        self.scroll_offset = 0  # 0 = viewing most recent (bottom), positive = scrolled up
+        self.auto_scroll = True  # Auto-scroll to bottom on new output
+
+        # Scan phase state for live table display
+        self.scan_results = []  # Store discovered APs during scan phase
+        self.scan_phase = True  # True during airodump/wash, False during attacks
 
         # Initialize curses colors
         try:
@@ -133,6 +231,8 @@ class WifiAuditTUI:
             print(line)
             return
         self.output_buffer.append(line)
+        if self.auto_scroll:
+            self.scroll_offset = 0  # Stay at bottom when auto-scrolling
 
     def update_progress_line(self, line: str, tag: str = "[SCAN]"):
         """Update the last line if it's a progress message, otherwise append."""
@@ -145,6 +245,57 @@ class WifiAuditTUI:
             self.output_buffer[-1] = line
         else:
             self.output_buffer.append(line)
+
+    def get_output_window_height(self):
+        """Get the number of lines available for output display."""
+        try:
+            max_y, _ = self.stdscr.getmaxyx()
+            # Estimate: header(3) + table(varies) + output_header(3) + margin(1)
+            return max(5, max_y - 20)
+        except:
+            return 10
+
+    def handle_input(self):
+        """Handle keyboard input for scrolling. Returns True if input was handled."""
+        if not self.enabled:
+            return False
+
+        try:
+            key = self.stdscr.getch()
+            if key == -1:  # No input
+                return False
+
+            max_scroll = max(0, len(self.output_buffer) - self.get_output_window_height())
+
+            if key == curses.KEY_UP or key == ord('k'):
+                self.scroll_offset = min(self.scroll_offset + 1, max_scroll)
+                self.auto_scroll = False
+                return True
+            elif key == curses.KEY_DOWN or key == ord('j'):
+                self.scroll_offset = max(self.scroll_offset - 1, 0)
+                if self.scroll_offset == 0:
+                    self.auto_scroll = True
+                return True
+            elif key == curses.KEY_PPAGE:  # Page Up
+                self.scroll_offset = min(self.scroll_offset + 10, max_scroll)
+                self.auto_scroll = False
+                return True
+            elif key == curses.KEY_NPAGE:  # Page Down
+                self.scroll_offset = max(self.scroll_offset - 10, 0)
+                if self.scroll_offset == 0:
+                    self.auto_scroll = True
+                return True
+            elif key == curses.KEY_HOME:
+                self.scroll_offset = max_scroll
+                self.auto_scroll = False
+                return True
+            elif key == curses.KEY_END:
+                self.scroll_offset = 0
+                self.auto_scroll = True
+                return True
+        except:
+            pass
+        return False
 
     def get_color_for_line(self, line: str) -> int:
         """Determine color pair based on line content."""
@@ -258,8 +409,54 @@ class WifiAuditTUI:
 
         return y
 
+    def draw_scan_table(self, y_offset: int) -> int:
+        """Draw discovered networks during scan phase. Returns next y position."""
+        max_y, max_x = self.stdscr.getmaxyx()
+        y = y_offset
+
+        try:
+            # Table header
+            header = f"{'#':<3} | {'ESSID':<20} | {'BSSID':<17} | {'CH':<3} | {'PWR':<4} | {'ENC':<8} | {'WPS':<5}"
+            self.stdscr.addstr(y, 0, header[:max_x - 1], curses.A_BOLD)
+            y += 1
+
+            separator = "-" * min(len(header), max_x - 1)
+            self.stdscr.addstr(y, 0, separator)
+            y += 1
+
+            # Show as many rows as fit
+            available_rows = max_y - y - 12  # Reserve space for output window
+            for idx, ap in enumerate(self.scan_results[:available_rows]):
+                num = f"{idx + 1}"
+                essid = ap.get('essid', '')[:20]
+                bssid = ap.get('bssid', '')
+                channel = ap.get('channel', '')[:3]
+                pwr = str(ap.get('pwr', ''))[:4]
+                enc = ap.get('privacy', '')[:8]
+                wps = ap.get('wps', '?')[:5]
+
+                # Color based on WPS status
+                if wps in ('WPS', 'Yes'):
+                    color = curses.color_pair(1)  # Green - WPS enabled
+                elif wps in ('Locked', 'Lck'):
+                    color = curses.color_pair(3)  # Yellow - WPS locked
+                else:
+                    color = 0
+
+                row = f"{num:<3} | {essid:<20} | {bssid:<17} | {channel:<3} | {pwr:<4} | {enc:<8} | {wps:<5}"
+                self.stdscr.addstr(y, 0, row[:max_x - 1], color)
+                y += 1
+
+                if y >= max_y - 12:
+                    break
+
+        except curses.error:
+            pass
+
+        return y
+
     def draw_output_window(self, y_offset: int):
-        """Draw the live output window."""
+        """Draw the live output window with scroll support."""
         max_y, max_x = self.stdscr.getmaxyx()
 
         try:
@@ -269,7 +466,11 @@ class WifiAuditTUI:
             self.stdscr.addstr(y, 0, separator)
             y += 1
 
-            header = "=== Live Audit Output (Last 50 lines) ==="
+            # Show scroll indicator in header if scrolled
+            if self.scroll_offset > 0:
+                header = f"=== Live Audit Output (Scrolled: +{self.scroll_offset} lines, ↓/j=newer) ==="
+            else:
+                header = "=== Live Audit Output (↑/k=scroll, Last 50 lines) ==="
             self.stdscr.addstr(y, 0, header.ljust(max_x - 1), curses.A_BOLD)
             y += 1
 
@@ -277,12 +478,19 @@ class WifiAuditTUI:
             self.stdscr.addstr(y, 0, separator)
             y += 1
 
-            # Draw output lines (most recent at bottom)
-            output_start_y = y
+            # Draw output lines with scroll offset
             available_lines = max_y - y - 1
+            total_lines = len(self.output_buffer)
 
-            # Get the last N lines that fit
-            lines_to_show = list(self.output_buffer)[-available_lines:]
+            # Calculate which lines to show based on scroll offset
+            if total_lines <= available_lines:
+                # All lines fit, no scrolling needed
+                lines_to_show = list(self.output_buffer)
+            else:
+                # Apply scroll offset (scroll_offset=0 means show most recent)
+                end_idx = total_lines - self.scroll_offset
+                start_idx = max(0, end_idx - available_lines)
+                lines_to_show = list(self.output_buffer)[start_idx:end_idx]
 
             for line in lines_to_show:
                 if y >= max_y - 1:
@@ -302,6 +510,9 @@ class WifiAuditTUI:
         if not self.enabled:
             return
 
+        # Handle any pending keyboard input for scrolling
+        self.handle_input()
+
         try:
             # Clear screen
             self.stdscr.clear()
@@ -309,7 +520,13 @@ class WifiAuditTUI:
             # Draw components
             y = 0
             y = self.draw_header(stats, y)
-            y = self.draw_targets_table(results, y)
+
+            # During scan phase, show discovered networks; during attack, show targets
+            if self.scan_phase and self.scan_results:
+                y = self.draw_scan_table(y)
+            else:
+                y = self.draw_targets_table(results, y)
+
             self.draw_output_window(y)
 
             # Refresh screen
@@ -335,13 +552,6 @@ class WifiAuditTUI:
 # Helpers
 # ---------------------------------------------------------
 
-# Cache for last known AP count (to handle read errors gracefully)
-_last_known_count = 0
-_last_wps_count = 0
-_last_csv_mtime = 0
-_last_csv_size = 0
-
-
 def check_monitor_mode(interface: str) -> bool:
     """Verify interface is in monitor mode."""
     try:
@@ -352,77 +562,6 @@ def check_monitor_mode(interface: str) -> bool:
         return "Mode:Monitor" in output
     except subprocess.CalledProcessError:
         return False
-
-
-def count_aps_in_csv(csv_file: str) -> tuple:
-    """Count number of access points discovered so far in airodump CSV.
-    Returns (total_count, wps_count) tuple."""
-    global _last_known_count, _last_wps_count, _last_csv_mtime, _last_csv_size
-
-    if not os.path.exists(csv_file):
-        return (0, 0)
-
-    try:
-        # Check if file has been modified
-        stat = os.stat(csv_file)
-        current_mtime = stat.st_mtime
-        current_size = stat.st_size
-
-        # If file unchanged, return cached count
-        if current_mtime == _last_csv_mtime and current_size == _last_csv_size:
-            return (_last_known_count, _last_wps_count)
-
-        # File changed, re-parse
-        count = 0
-        wps_count = 0
-        with open(csv_file, newline="", encoding="utf-8", errors="ignore") as f:
-            reader = csv.reader(f)
-            in_ap_section = False
-
-            for row in reader:
-                if not row:
-                    continue
-
-                # Find the AP section header
-                if row[0] == "BSSID":
-                    in_ap_section = True
-                    continue
-
-                # Count APs until we hit the Station section
-                if in_ap_section:
-                    # Require at least 1 column for BSSID (be lenient during live scan)
-                    if len(row) < 1:
-                        continue
-
-                    try:
-                        bssid = row[0].strip()
-
-                        # Stop at Station MAC section
-                        if not bssid or bssid == "Station MAC":
-                            break
-
-                        # Valid AP entry (has valid BSSID)
-                        if bssid and ":" in bssid:
-                            count += 1
-                            # Check WPS column (index 14) if available
-                            if len(row) > 14:
-                                wps_status = row[14].strip() if row[14] else ""
-                                if wps_status in ("WPS", "Locked", "Lck"):
-                                    wps_count += 1
-                    except (IndexError, AttributeError):
-                        # Skip malformed rows
-                        continue
-
-        # Update cache with successful read
-        _last_known_count = count
-        _last_wps_count = wps_count
-        _last_csv_mtime = current_mtime
-        _last_csv_size = current_size
-        return (count, wps_count)
-
-    except Exception:
-        # If read fails, return last successful count
-        return (_last_known_count, _last_wps_count)
 
 
 def run_airodump(interface: str, duration: int, prefix: str, tui=None) -> str:
@@ -449,13 +588,13 @@ def run_airodump(interface: str, duration: int, prefix: str, tui=None) -> str:
         bar = "█" * filled + "░" * (bar_width - filled)
         percent = int(progress * 100)
 
-        # Count SSIDs and WPS-potential APs discovered so far
-        ssid_count, wps_count = count_aps_in_csv(csv_path)
+        # Parse CSV once (cached) - gets counts and AP list in single call
+        ssid_count, wps_count, aps = parse_csv_cached(csv_path)
 
         msg = f"[SCAN] |{bar}| {percent}% ({elapsed}/{duration}s) | SSIDs: {ssid_count} (WPS: {wps_count})"
         if tui and tui.enabled:
+            tui.scan_results = aps  # Direct assignment, already sorted
             tui.update_progress_line(msg, "[SCAN]")
-            # Refresh display to show progress during scan
             dummy_stats = {'total': 0, 'completed': 0, 'success': 0, 'failed': 0, 'locked': 0}
             tui.refresh_display([], dummy_stats)
         else:
@@ -1064,6 +1203,10 @@ def run_main_logic(args, tui=None):
             # If airodump detected WPS but wash didn't find it, keep airodump's values
     else:
         tui_print("[*] Skipping wash scan, using airodump WPS data only", tui)
+
+    # Switch from scan phase to attack phase (changes table display)
+    if tui and tui.enabled:
+        tui.scan_phase = False
 
     # Sort strongest first (PWR closer to 0)
     sorted_aps = sorted(aps.values(), key=lambda x: x.pwr, reverse=True)
