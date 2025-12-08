@@ -337,6 +337,7 @@ class WifiAuditTUI:
 
 # Cache for last known AP count (to handle read errors gracefully)
 _last_known_count = 0
+_last_wps_count = 0
 _last_csv_mtime = 0
 _last_csv_size = 0
 
@@ -353,12 +354,13 @@ def check_monitor_mode(interface: str) -> bool:
         return False
 
 
-def count_aps_in_csv(csv_file: str) -> int:
-    """Count number of access points discovered so far in airodump CSV."""
-    global _last_known_count, _last_csv_mtime, _last_csv_size
+def count_aps_in_csv(csv_file: str) -> tuple:
+    """Count number of access points discovered so far in airodump CSV.
+    Returns (total_count, wps_count) tuple."""
+    global _last_known_count, _last_wps_count, _last_csv_mtime, _last_csv_size
 
     if not os.path.exists(csv_file):
-        return 0
+        return (0, 0)
 
     try:
         # Check if file has been modified
@@ -368,10 +370,11 @@ def count_aps_in_csv(csv_file: str) -> int:
 
         # If file unchanged, return cached count
         if current_mtime == _last_csv_mtime and current_size == _last_csv_size:
-            return _last_known_count
+            return (_last_known_count, _last_wps_count)
 
         # File changed, re-parse
         count = 0
+        wps_count = 0
         with open(csv_file, newline="", encoding="utf-8", errors="ignore") as f:
             reader = csv.reader(f)
             in_ap_section = False
@@ -387,8 +390,8 @@ def count_aps_in_csv(csv_file: str) -> int:
 
                 # Count APs until we hit the Station section
                 if in_ap_section:
-                    # Require at least 14 columns (matches parse_airodump_csv behavior)
-                    if len(row) < 14:
+                    # Require at least 1 column for BSSID (be lenient during live scan)
+                    if len(row) < 1:
                         continue
 
                     try:
@@ -401,19 +404,25 @@ def count_aps_in_csv(csv_file: str) -> int:
                         # Valid AP entry (has valid BSSID)
                         if bssid and ":" in bssid:
                             count += 1
+                            # Check WPS column (index 14) if available
+                            if len(row) > 14:
+                                wps_status = row[14].strip() if row[14] else ""
+                                if wps_status in ("WPS", "Locked", "Lck"):
+                                    wps_count += 1
                     except (IndexError, AttributeError):
                         # Skip malformed rows
                         continue
 
         # Update cache with successful read
         _last_known_count = count
+        _last_wps_count = wps_count
         _last_csv_mtime = current_mtime
         _last_csv_size = current_size
-        return count
+        return (count, wps_count)
 
     except Exception:
         # If read fails, return last successful count
-        return _last_known_count
+        return (_last_known_count, _last_wps_count)
 
 
 def run_airodump(interface: str, duration: int, prefix: str, tui=None) -> str:
@@ -440,10 +449,10 @@ def run_airodump(interface: str, duration: int, prefix: str, tui=None) -> str:
         bar = "█" * filled + "░" * (bar_width - filled)
         percent = int(progress * 100)
 
-        # Count SSIDs discovered so far
-        ssid_count = count_aps_in_csv(csv_path)
+        # Count SSIDs and WPS-potential APs discovered so far
+        ssid_count, wps_count = count_aps_in_csv(csv_path)
 
-        msg = f"[SCAN] |{bar}| {percent}% ({elapsed}/{duration}s) | SSIDs: {ssid_count}"
+        msg = f"[SCAN] |{bar}| {percent}% ({elapsed}/{duration}s) | SSIDs: {ssid_count} (WPS: {wps_count})"
         if tui and tui.enabled:
             tui.update_progress_line(msg, "[SCAN]")
             # Refresh display to show progress during scan
@@ -538,18 +547,23 @@ def parse_airodump_csv(csv_file: str) -> Dict[str, AccessPoint]:
 
 def run_wash(interface: str, duration: int = 120, tui=None) -> Dict[str, Dict[str, str]]:
     """Run wash and collect WPS + Locked data."""
+    import select
+
     tui_print(f"[+] Running wash for {duration} seconds (WPS lock validation)...", tui)
 
-    # Run wash in background
+    # Run wash in background with line-buffered output
     proc = subprocess.Popen(
         ["timeout", str(duration), "wash", "-i", interface],
         stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL
+        stderr=subprocess.DEVNULL,
+        bufsize=1  # Line buffered
     )
 
-    # Show progress bar while scanning
+    # Show progress bar while scanning, reading output incrementally
     start = time.time()
     bar_width = 40
+    output_lines = []
+    wps_found = 0
 
     while proc.poll() is None:
         elapsed = int(time.time() - start)
@@ -558,7 +572,22 @@ def run_wash(interface: str, duration: int = 120, tui=None) -> Dict[str, Dict[st
         bar = "█" * filled + "░" * (bar_width - filled)
         percent = int(progress * 100)
 
-        msg = f"[WASH] |{bar}| {percent}% ({elapsed}/{duration}s)"
+        # Try to read any available output (non-blocking)
+        try:
+            # Use select to check if data is available (Unix only)
+            ready, _, _ = select.select([proc.stdout], [], [], 0.1)
+            if ready:
+                line = proc.stdout.readline()
+                if line:
+                    decoded_line = line.decode(errors='ignore')
+                    output_lines.append(decoded_line)
+                    # Count if it's a valid WPS line (has BSSID in first 17 chars)
+                    if len(decoded_line) > 17 and ":" in decoded_line[:17]:
+                        wps_found += 1
+        except:
+            pass
+
+        msg = f"[WASH] |{bar}| {percent}% ({elapsed}/{duration}s) | Confirmed WPS: {wps_found}"
         if tui and tui.enabled:
             tui.update_progress_line(msg, "[WASH]")
             # Refresh display to show progress during scan
@@ -569,7 +598,18 @@ def run_wash(interface: str, duration: int = 120, tui=None) -> Dict[str, Dict[st
 
         if elapsed >= duration:
             break
-        time.sleep(0.5)
+        time.sleep(0.4)  # Slightly shorter sleep to be more responsive
+
+    # Read any remaining output
+    try:
+        remaining = proc.stdout.read()
+        if remaining:
+            for line in remaining.decode(errors='ignore').splitlines():
+                output_lines.append(line)
+                if len(line) > 17 and ":" in line[:17]:
+                    wps_found += 1
+    except:
+        pass
 
     proc.wait()
 
@@ -580,13 +620,8 @@ def run_wash(interface: str, duration: int = 120, tui=None) -> Dict[str, Dict[st
     if not (tui and tui.enabled):
         print()  # New line after progress bar for legacy mode
 
-    # Get the output
-    try:
-        output, _ = proc.communicate(timeout=5)
-        output = output.decode()
-    except:
-        tui_print("[!] wash failed or interface busy.", tui)
-        return {}
+    # Process the collected output
+    output = "\n".join(output_lines)
 
     wps_data = {}
 
