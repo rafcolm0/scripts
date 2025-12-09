@@ -286,6 +286,9 @@ class WifiAuditTUI:
         self.table_total_items = 0
         self.output_total_lines = 0
 
+        # Skip/cancel current target flag
+        self.skip_current_target = False
+
         # Initialize curses colors
         try:
             curses.start_color()
@@ -362,7 +365,8 @@ class WifiAuditTUI:
             completed = stats['completed']
             percent = int((completed / total) * 100) if total > 0 else 0
 
-            stats_line = f"Overall: [{completed}/{total}] ({percent}%) | Success: {stats['success']} | Failed: {stats['failed']} | Locked: {stats['locked']}"
+            cancelled = stats.get('cancelled', 0)
+            stats_line = f"Overall: [{completed}/{total}] ({percent}%) | Success: {stats['success']} | Failed: {stats['failed']} | Locked: {stats['locked']} | Cancelled: {cancelled}"
             self.stdscr.addstr(y, 0, stats_line.ljust(max_x - 1))
             y += 1
 
@@ -387,26 +391,20 @@ class WifiAuditTUI:
         self.table_total_items = total_targets
 
         try:
-            # Calculate available rows
-            available_rows = max(1, max_y - y - 14)  # Reserve space for output window
+            # Calculate available rows - limit to max 30% of terminal height
+            max_table_rows = int(max_y * 0.30)
+            available_rows = max(1, min(max_table_rows, total_targets))
 
             # Clamp scroll offset
             max_scroll = max(0, total_targets - available_rows)
             self.table_scroll_offset = max(0, min(self.table_scroll_offset, max_scroll))
 
-            # Scroll indicators
-            has_more_above = self.table_scroll_offset > 0
+            # Check if there are more items below visible area
             has_more_below = (self.table_scroll_offset + available_rows) < total_targets
 
-            # Table header with scroll indicator and active pane marker
-            pane_marker = "[*]" if self.active_pane == 'table' else "[ ]"
-            scroll_up_ind = "▲" if has_more_above else " "
-            header = f"{pane_marker} {'#':<3} | {'ESSID':<20} | {'BSSID':<17} | {'Session':<12} | {'Result/Progress':<40} {scroll_up_ind}"
-
-            header_attr = curses.A_BOLD
-            if self.active_pane == 'table':
-                header_attr |= curses.color_pair(6)
-            self.stdscr.addstr(y, 0, header[:max_x - 1], header_attr)
+            # Table header
+            header = f"{'#':<3} | {'ESSID':<20} | {'BSSID':<17} | {'Session':<12} | {'Result/Progress':<40}"
+            self.stdscr.addstr(y, 0, header[:max_x - 1], curses.A_BOLD)
             y += 1
 
             # Separator
@@ -427,6 +425,8 @@ class WifiAuditTUI:
                     session = "Pending"
                 elif result.status == "IN_PROGRESS":
                     session = "In Progress"
+                elif result.status == "CANCELLED":
+                    session = "Cancelled"
                 elif result.status in ["SUCCESS", "FAILED", "LOCKED"]:
                     session = "Completed"
                 else:
@@ -453,18 +453,21 @@ class WifiAuditTUI:
                 elif result.status == "FAILED":
                     progress = "FAILED"
                     color = curses.color_pair(2)  # Red
+                elif result.status == "CANCELLED":
+                    progress = "Skipped by user"
+                    color = curses.color_pair(3)  # Yellow
                 else:
                     progress = result.status
                     color = 0
 
-                row = f"    {num:<3} | {essid:<20} | {bssid:<17} | {session:<12} | {progress:<40}"
+                row = f"{num:<3} | {essid:<20} | {bssid:<17} | {session:<12} | {progress:<40}"
                 self.stdscr.addstr(y, 0, row[:max_x - 1], color)
                 y += 1
 
             # Show "more below" indicator
             if has_more_below:
                 remaining = total_targets - self.table_scroll_offset - available_rows
-                more_indicator = f"    ▼ {remaining} more below ▼"
+                more_indicator = f"▼ {remaining} more below ▼"
                 self.stdscr.addstr(y, 0, more_indicator[:max_x - 1], curses.A_DIM)
                 y += 1
 
@@ -480,7 +483,7 @@ class WifiAuditTUI:
         """Draw discovered networks during scan phase. Returns next y position.
 
         Only displays networks with WPS 1.0, 2.0, or Locked status.
-        Supports independent scrolling.
+        Supports scrolling, limited to max 30% terminal height.
         """
         max_y, max_x = self.stdscr.getmaxyx()
         y = y_offset
@@ -499,26 +502,20 @@ class WifiAuditTUI:
         self.table_start_y = y
 
         try:
-            # Calculate available rows for table content
-            available_rows = max(1, max_y - y - 14)  # Reserve space for output window
+            # Calculate available rows - limit to max 30% of terminal height
+            max_table_rows = int(max_y * 0.30)
+            available_rows = max(1, min(max_table_rows, total_wps))
 
             # Clamp scroll offset
             max_scroll = max(0, total_wps - available_rows)
             self.table_scroll_offset = max(0, min(self.table_scroll_offset, max_scroll))
 
-            # Scroll indicators
-            has_more_above = self.table_scroll_offset > 0
+            # Check if there are more items below visible area
             has_more_below = (self.table_scroll_offset + available_rows) < total_wps
 
-            # Table header with scroll indicators and active pane marker
-            pane_marker = "[*]" if self.active_pane == 'table' else "[ ]"
-            scroll_up_ind = "▲" if has_more_above else " "
-            header = f"{pane_marker} {'#':<3} | {'ESSID':<20} | {'BSSID':<17} | {'CH':<3} | {'PWR':<4} | {'ENC':<8} | {'WPS':<6} {scroll_up_ind} [Total: {total_wps}]"
-
-            header_attr = curses.A_BOLD
-            if self.active_pane == 'table':
-                header_attr |= curses.color_pair(6)
-            self.stdscr.addstr(y, 0, header[:max_x - 1], header_attr)
+            # Table header
+            header = f"{'#':<3} | {'ESSID':<20} | {'BSSID':<17} | {'CH':<3} | {'PWR':<4} | {'ENC':<8} | {'WPS':<6} [Total: {total_wps}]"
+            self.stdscr.addstr(y, 0, header[:max_x - 1], curses.A_BOLD)
             y += 1
 
             separator = "-" * min(len(header), max_x - 1)
@@ -551,17 +548,14 @@ class WifiAuditTUI:
                 else:
                     color = curses.color_pair(1)  # Green - WPS 1.0/2.0
 
-                row = f"    {num:<3} | {essid:<20} | {bssid:<17} | {channel:<3} | {pwr:<4} | {enc:<8} | {wps:<6}"
+                row = f"{num:<3} | {essid:<20} | {bssid:<17} | {channel:<3} | {pwr:<4} | {enc:<8} | {wps:<6}"
                 self.stdscr.addstr(y, 0, row[:max_x - 1], color)
                 y += 1
-
-                if y >= max_y - 12:
-                    break
 
             # Show "more below" indicator
             if has_more_below:
                 remaining = total_wps - self.table_scroll_offset - available_rows
-                more_indicator = f"    ▼ {remaining} more below ▼"
+                more_indicator = f"▼ {remaining} more below ▼"
                 self.stdscr.addstr(y, 0, more_indicator[:max_x - 1], curses.A_DIM)
                 y += 1
 
@@ -574,7 +568,7 @@ class WifiAuditTUI:
         return y
 
     def draw_output_window(self, y_offset: int):
-        """Draw the live output window with independent scrolling."""
+        """Draw the live output window (always shows latest lines, no scrolling)."""
         max_y, max_x = self.stdscr.getmaxyx()
 
         # Store output window start position
@@ -587,41 +581,27 @@ class WifiAuditTUI:
             self.stdscr.addstr(y, 0, separator)
             y += 1
 
-            # Calculate available lines for content
-            available_lines = max(1, max_y - y - 2)  # Reserve 1 for header, 1 for footer
-            total_lines = len(self.output_buffer)
-            self.output_total_lines = total_lines
-
-            # Clamp scroll offset
-            max_scroll = max(0, total_lines - available_lines)
-            self.output_scroll_offset = max(0, min(self.output_scroll_offset, max_scroll))
-
-            # Scroll indicators
-            has_more_above = self.output_scroll_offset > 0
-            has_more_below = (self.output_scroll_offset + available_lines) < total_lines
-
-            # Header with scroll indicator and active pane marker
-            pane_marker = "[*]" if self.active_pane == 'output' else "[ ]"
-            scroll_up_ind = f"▲ {self.output_scroll_offset} above" if has_more_above else ""
-            header = f"{pane_marker} === Live Audit Output === {scroll_up_ind}"
-
-            header_attr = curses.A_BOLD
-            if self.active_pane == 'output':
-                header_attr |= curses.color_pair(6)
-            self.stdscr.addstr(y, 0, header.ljust(max_x - 1)[:max_x - 1], header_attr)
+            # Header (no pane markers since output is not scrollable)
+            header = "=== Live Audit Output ==="
+            self.stdscr.addstr(y, 0, header.ljust(max_x - 1)[:max_x - 1], curses.A_BOLD)
             y += 1
 
             separator = "=" * (max_x - 1)
             self.stdscr.addstr(y, 0, separator)
             y += 1
 
-            # Get all lines as a list
-            all_lines = list(self.output_buffer)
+            # Calculate available lines for content
+            available_lines = max(1, max_y - y - 1)  # Reserve 1 for footer
 
-            # Get visible slice based on scroll offset
-            start_idx = self.output_scroll_offset
-            end_idx = min(start_idx + available_lines, total_lines)
-            visible_lines = all_lines[start_idx:end_idx]
+            # Get all lines as a list and show only the latest (tail behavior)
+            all_lines = list(self.output_buffer)
+            total_lines = len(all_lines)
+
+            # Always show the most recent lines
+            if total_lines > available_lines:
+                visible_lines = all_lines[-available_lines:]
+            else:
+                visible_lines = all_lines
 
             for line in visible_lines:
                 if y >= max_y - 1:
@@ -631,12 +611,6 @@ class WifiAuditTUI:
                 display_line = line[:max_x - 1]
                 self.stdscr.addstr(y, 0, display_line, color)
                 y += 1
-
-            # Show "more below" indicator at the bottom
-            if has_more_below and y < max_y:
-                remaining = total_lines - self.output_scroll_offset - available_lines
-                more_indicator = f"▼ {remaining} more lines below ▼"
-                self.stdscr.addstr(y, 0, more_indicator[:max_x - 1], curses.A_DIM)
 
         except curses.error:
             pass
@@ -666,10 +640,9 @@ class WifiAuditTUI:
 
             self.draw_output_window(y)
 
-            # Draw help footer showing controls
+            # Draw help footer showing skip key
             max_y, max_x = self.stdscr.getmaxyx()
-            active_label = "Table" if self.active_pane == 'table' else "Output"
-            help_text = f"[Tab: switch pane] [↑/↓/j/k: scroll] [PgUp/PgDn: page] [Mouse wheel: scroll] | Active: {active_label}"
+            help_text = "[s] Skip current target"
             try:
                 self.stdscr.addstr(max_y - 1, 0, help_text[:max_x - 1], curses.A_DIM)
             except curses.error:
@@ -695,7 +668,7 @@ class WifiAuditTUI:
         self.add_output_line(message)
 
     def handle_input(self):
-        """Handle keyboard and mouse input for scrolling."""
+        """Handle keyboard and mouse input for table scrolling and skip command."""
         if not self.enabled:
             return
 
@@ -704,104 +677,63 @@ class WifiAuditTUI:
             if key == -1:
                 return  # No input
 
-            max_y, _ = self.stdscr.getmaxyx()
-
-            # Calculate visible rows for each pane
+            # Calculate visible rows for table
             table_visible_rows = max(1, self.table_end_y - self.table_start_y - 2)
-            output_visible_lines = max(1, max_y - self.output_start_y - 4)
 
-            # Handle mouse events
+            # Handle mouse events (only for table scrolling)
             if key == curses.KEY_MOUSE:
                 try:
                     _, mx, my, _, bstate = curses.getmouse()
 
-                    # Determine which pane the mouse is over
+                    # Only scroll if mouse is over table area
                     mouse_in_table = self.table_start_y <= my < self.table_end_y
-                    mouse_in_output = my >= self.output_start_y
 
-                    # Scroll wheel up (button 4)
-                    if bstate & curses.BUTTON4_PRESSED:
-                        if mouse_in_table:
+                    if mouse_in_table:
+                        max_offset = max(0, self.table_total_items - table_visible_rows)
+
+                        # Scroll wheel up (button 4)
+                        if bstate & curses.BUTTON4_PRESSED:
                             self.table_scroll_offset = max(0, self.table_scroll_offset - 3)
-                        elif mouse_in_output:
-                            self.output_scroll_offset = max(0, self.output_scroll_offset - 3)
-
-                    # Scroll wheel down (button 5 - reported as REPORT_MOUSE_POSITION on some systems)
-                    elif bstate & (curses.BUTTON5_PRESSED if hasattr(curses, 'BUTTON5_PRESSED') else 0x200000):
-                        if mouse_in_table:
-                            max_offset = max(0, self.table_total_items - table_visible_rows)
+                        # Scroll wheel down (button 5)
+                        elif bstate & (curses.BUTTON5_PRESSED if hasattr(curses, 'BUTTON5_PRESSED') else 0x200000):
                             self.table_scroll_offset = min(max_offset, self.table_scroll_offset + 3)
-                        elif mouse_in_output:
-                            max_offset = max(0, self.output_total_lines - output_visible_lines)
-                            self.output_scroll_offset = min(max_offset, self.output_scroll_offset + 3)
-
-                    # Also try alternative scroll detection (some terminals use different codes)
-                    elif bstate & 0x10000:  # Scroll up alternative
-                        if mouse_in_table:
+                        # Alternative scroll detection
+                        elif bstate & 0x10000:
                             self.table_scroll_offset = max(0, self.table_scroll_offset - 3)
-                        elif mouse_in_output:
-                            self.output_scroll_offset = max(0, self.output_scroll_offset - 3)
-                    elif bstate & 0x200000:  # Scroll down alternative
-                        if mouse_in_table:
-                            max_offset = max(0, self.table_total_items - table_visible_rows)
+                        elif bstate & 0x200000:
                             self.table_scroll_offset = min(max_offset, self.table_scroll_offset + 3)
-                        elif mouse_in_output:
-                            max_offset = max(0, self.output_total_lines - output_visible_lines)
-                            self.output_scroll_offset = min(max_offset, self.output_scroll_offset + 3)
 
                 except curses.error:
                     pass
                 return
 
-            # Tab - switch active pane
-            if key == ord('\t'):
-                self.active_pane = 'output' if self.active_pane == 'table' else 'table'
+            # 's' key - skip/cancel current target
+            if key == ord('s'):
+                self.skip_current_target = True
+                self.add_output_line("[!] Skip requested - cancelling current target...")
                 return
 
-            # Get scroll target based on active pane
-            if self.active_pane == 'table':
-                max_offset = max(0, self.table_total_items - table_visible_rows)
+            # Table scrolling (always active, no pane switching needed)
+            max_offset = max(0, self.table_total_items - table_visible_rows)
 
-                # Up arrow or 'k'
-                if key in (curses.KEY_UP, ord('k')):
-                    self.table_scroll_offset = max(0, self.table_scroll_offset - 1)
-                # Down arrow or 'j'
-                elif key in (curses.KEY_DOWN, ord('j')):
-                    self.table_scroll_offset = min(max_offset, self.table_scroll_offset + 1)
-                # Page Up
-                elif key == curses.KEY_PPAGE:
-                    self.table_scroll_offset = max(0, self.table_scroll_offset - table_visible_rows)
-                # Page Down
-                elif key == curses.KEY_NPAGE:
-                    self.table_scroll_offset = min(max_offset, self.table_scroll_offset + table_visible_rows)
-                # Home
-                elif key == curses.KEY_HOME:
-                    self.table_scroll_offset = 0
-                # End
-                elif key == curses.KEY_END:
-                    self.table_scroll_offset = max_offset
-
-            else:  # output pane
-                max_offset = max(0, self.output_total_lines - output_visible_lines)
-
-                # Up arrow or 'k'
-                if key in (curses.KEY_UP, ord('k')):
-                    self.output_scroll_offset = max(0, self.output_scroll_offset - 1)
-                # Down arrow or 'j'
-                elif key in (curses.KEY_DOWN, ord('j')):
-                    self.output_scroll_offset = min(max_offset, self.output_scroll_offset + 1)
-                # Page Up
-                elif key == curses.KEY_PPAGE:
-                    self.output_scroll_offset = max(0, self.output_scroll_offset - output_visible_lines)
-                # Page Down
-                elif key == curses.KEY_NPAGE:
-                    self.output_scroll_offset = min(max_offset, self.output_scroll_offset + output_visible_lines)
-                # Home
-                elif key == curses.KEY_HOME:
-                    self.output_scroll_offset = 0
-                # End
-                elif key == curses.KEY_END:
-                    self.output_scroll_offset = max_offset
+            # Up arrow or 'k'
+            if key in (curses.KEY_UP, ord('k')):
+                self.table_scroll_offset = max(0, self.table_scroll_offset - 1)
+            # Down arrow or 'j'
+            elif key in (curses.KEY_DOWN, ord('j')):
+                self.table_scroll_offset = min(max_offset, self.table_scroll_offset + 1)
+            # Page Up
+            elif key == curses.KEY_PPAGE:
+                self.table_scroll_offset = max(0, self.table_scroll_offset - table_visible_rows)
+            # Page Down
+            elif key == curses.KEY_NPAGE:
+                self.table_scroll_offset = min(max_offset, self.table_scroll_offset + table_visible_rows)
+            # Home
+            elif key == curses.KEY_HOME:
+                self.table_scroll_offset = 0
+            # End
+            elif key == curses.KEY_END:
+                self.table_scroll_offset = max_offset
 
         except curses.error:
             pass
@@ -1337,6 +1269,31 @@ def run_reaver_attack(target: AccessPoint, interface: str, result_obj: AttackRes
                     update_targets_table(all_results, stats, tui)
                     last_refresh = time.time()
 
+                # Check for skip/cancel request from user
+                if tui and tui.enabled and tui.skip_current_target:
+                    tui.skip_current_target = False  # Reset flag
+                    tui_print("[!] User cancelled - skipping to next target", tui)
+                    proc.kill()
+                    proc.wait()
+
+                    elapsed = time.time() - start_time
+                    result_obj.status = "CANCELLED"
+                    result_obj.wps_pin = "-"
+                    result_obj.password = "-"
+                    result_obj.time_spent = elapsed
+                    result_obj.retries = retry_count
+                    update_targets_table(all_results, stats, tui)
+
+                    # Log cancelled summary
+                    if log_file:
+                        log_file.write(f"\n--- RESULT: CANCELLED ---\n")
+                        log_file.write(f"Skipped by user\n")
+                        log_file.write(f"Time: {int(elapsed)}s | Retries: {retry_count}\n")
+                        log_file.write(f"Ended: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+                        log_file.flush()
+
+                    return result_obj
+
                 if line:
                     # Check for success
                     if "[+] WPS PIN:" in line:
@@ -1714,6 +1671,7 @@ def run_main_logic(args, tui=None):
         'success': 0,
         'failed': 0,
         'locked': 0,
+        'cancelled': 0,
         'current_target': None,
         'current_index': 0
     }
@@ -1786,6 +1744,8 @@ def run_main_logic(args, tui=None):
             stats['success'] += 1
         elif result.status == "LOCKED":
             stats['locked'] += 1
+        elif result.status == "CANCELLED":
+            stats['cancelled'] += 1
         else:
             stats['failed'] += 1
 
@@ -1795,7 +1755,7 @@ def run_main_logic(args, tui=None):
     # Close reaver log file
     reaver_log.write(f"\n{'='*80}\n")
     reaver_log.write(f"All attacks completed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-    reaver_log.write(f"Success: {stats['success']} | Failed: {stats['failed']} | Locked: {stats['locked']}\n")
+    reaver_log.write(f"Success: {stats['success']} | Failed: {stats['failed']} | Locked: {stats['locked']} | Cancelled: {stats['cancelled']}\n")
     reaver_log.close()
     print(f"[+] Complete reaver output saved to: {reaver_log_filename}")
 
