@@ -367,7 +367,8 @@ class WifiAuditTUI:
             percent = int((completed / total) * 100) if total > 0 else 0
 
             cancelled = stats.get('cancelled', 0)
-            stats_line = f"Overall: [{completed}/{total}] ({percent}%) | Success: {stats['success']} | Failed: {stats['failed']} | Locked: {stats['locked']} | Cancelled: {cancelled}"
+            timeout_count = stats.get('timeout', 0)
+            stats_line = f"Overall: [{completed}/{total}] ({percent}%) | Success: {stats['success']} | Failed: {stats['failed']} | Locked: {stats['locked']} | Cancelled: {cancelled} | Timeout: {timeout_count}"
             self.stdscr.addstr(y, 0, stats_line.ljust(max_x - 1))
             y += 1
 
@@ -428,6 +429,8 @@ class WifiAuditTUI:
                     session = "In Progress"
                 elif result.status == "CANCELLED":
                     session = "Cancelled"
+                elif result.status == "TIMEOUT":
+                    session = "Timeout"
                 elif result.status in ["SUCCESS", "FAILED", "LOCKED"]:
                     session = "Completed"
                 else:
@@ -456,6 +459,9 @@ class WifiAuditTUI:
                     color = curses.color_pair(2)  # Red
                 elif result.status == "CANCELLED":
                     progress = "Skipped by user"
+                    color = curses.color_pair(3)  # Yellow
+                elif result.status == "TIMEOUT":
+                    progress = "Max time exceeded"
                     color = curses.color_pair(3)  # Yellow
                 else:
                     progress = result.status
@@ -1131,7 +1137,8 @@ def run_reaver_attack(target: AccessPoint, interface: str, result_obj: AttackRes
                       timeout: int = 10, delay: int = 3, lock_delay: int = 60,
                       recurring_delay: str = None, win7: bool = False,
                       dh_small: bool = False, start_pin: str = None,
-                      no_nacks: bool = False, eap_terminate: bool = False) -> AttackResult:
+                      no_nacks: bool = False, eap_terminate: bool = False,
+                      max_target_time: int = 1800) -> AttackResult:
     """
     Run reaver against a single target with lock detection/retry logic.
     Updates result_obj in real-time for live progress display.
@@ -1147,6 +1154,7 @@ def run_reaver_attack(target: AccessPoint, interface: str, result_obj: AttackRes
         start_pin: Start with specific PIN (for resuming)
         no_nacks: Don't send NACK messages
         eap_terminate: Terminate sessions with EAP FAIL
+        max_target_time: Maximum time for this target in seconds (0 = unlimited)
     """
     start_time = time.time()
     retry_count = 0
@@ -1165,6 +1173,26 @@ def run_reaver_attack(target: AccessPoint, interface: str, result_obj: AttackRes
         log_file.flush()
 
     while retry_count <= max_retries:
+        # Check max target time limit
+        if max_target_time > 0 and (time.time() - start_time) >= max_target_time:
+            tui_print(f"[!] Max target time ({max_target_time}s) reached, moving to next target", tui)
+            elapsed = time.time() - start_time
+            result_obj.status = "TIMEOUT"
+            result_obj.wps_pin = "-"
+            result_obj.password = "-"
+            result_obj.time_spent = elapsed
+            result_obj.retries = retry_count
+            update_targets_table(all_results, stats, tui)
+
+            if log_file:
+                log_file.write(f"\n--- RESULT: TIMEOUT ---\n")
+                log_file.write(f"Max target time ({max_target_time}s) exceeded\n")
+                log_file.write(f"Time: {int(elapsed)}s | Retries: {retry_count}\n")
+                log_file.write(f"Ended: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+                log_file.flush()
+
+            return result_obj
+
         # Build reaver command with all options
         cmd = [
             "reaver",
@@ -1342,6 +1370,29 @@ def run_reaver_attack(target: AccessPoint, interface: str, result_obj: AttackRes
                     locked = True
                     proc.kill()
                     break
+
+                # Check max target time limit inside the loop for faster response
+                if max_target_time > 0 and (time.time() - start_time) >= max_target_time:
+                    tui_print(f"[!] Max target time ({max_target_time}s) reached", tui)
+                    proc.kill()
+                    proc.wait()
+
+                    elapsed = time.time() - start_time
+                    result_obj.status = "TIMEOUT"
+                    result_obj.wps_pin = "-"
+                    result_obj.password = "-"
+                    result_obj.time_spent = elapsed
+                    result_obj.retries = retry_count
+                    update_targets_table(all_results, stats, tui)
+
+                    if log_file:
+                        log_file.write(f"\n--- RESULT: TIMEOUT ---\n")
+                        log_file.write(f"Max target time ({max_target_time}s) exceeded\n")
+                        log_file.write(f"Time: {int(elapsed)}s | Retries: {retry_count}\n")
+                        log_file.write(f"Ended: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+                        log_file.flush()
+
+                    return result_obj
 
             proc.wait()
 
@@ -1683,6 +1734,7 @@ def run_main_logic(args, tui=None):
         'failed': 0,
         'locked': 0,
         'cancelled': 0,
+        'timeout': 0,
         'current_target': None,
         'current_index': 0
     }
@@ -1717,8 +1769,22 @@ def run_main_logic(args, tui=None):
     reaver_log.flush()
     tui_print(f"[+] Reaver output logging to: {reaver_log_filename}", tui)
 
+    # Track session start time for max_session_time
+    session_start_time = time.time()
+
     # Attack each target
     for idx, target in enumerate(targets, 1):
+        # Check session timeout before starting next target
+        if args.max_session_time > 0:
+            session_elapsed = time.time() - session_start_time
+            if session_elapsed >= args.max_session_time:
+                tui_print(f"[!] Max session time ({args.max_session_time}s) reached, stopping all attacks", tui)
+                # Mark remaining targets as not attempted
+                for remaining_idx in range(idx - 1, len(results)):
+                    if results[remaining_idx].status == "PENDING":
+                        results[remaining_idx].status = "SKIPPED"
+                break
+
         stats['current_target'] = target
         stats['current_index'] = idx
 
@@ -1746,7 +1812,8 @@ def run_main_logic(args, tui=None):
             dh_small=args.dh_small,
             start_pin=args.start_pin,
             no_nacks=args.no_nacks,
-            eap_terminate=args.eap_terminate
+            eap_terminate=args.eap_terminate,
+            max_target_time=args.max_target_time
         )
 
         # Update stats
@@ -1757,6 +1824,8 @@ def run_main_logic(args, tui=None):
             stats['locked'] += 1
         elif result.status == "CANCELLED":
             stats['cancelled'] += 1
+        elif result.status == "TIMEOUT":
+            stats['timeout'] += 1
         else:
             stats['failed'] += 1
 
@@ -1766,7 +1835,7 @@ def run_main_logic(args, tui=None):
     # Close reaver log file
     reaver_log.write(f"\n{'='*80}\n")
     reaver_log.write(f"All attacks completed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-    reaver_log.write(f"Success: {stats['success']} | Failed: {stats['failed']} | Locked: {stats['locked']} | Cancelled: {stats['cancelled']}\n")
+    reaver_log.write(f"Success: {stats['success']} | Failed: {stats['failed']} | Locked: {stats['locked']} | Cancelled: {stats['cancelled']} | Timeout: {stats['timeout']}\n")
     reaver_log.close()
     print(f"[+] Complete reaver output saved to: {reaver_log_filename}")
 
@@ -1902,6 +1971,20 @@ def main():
         "--eap-terminate", "-E",
         action="store_true",
         help="terminate each WPS session with EAP FAIL packet"
+    )
+    parser.add_argument(
+        "--max-target-time",
+        type=int,
+        default=1800,
+        metavar="SEC",
+        help="maximum time per target in seconds (default: 1800 = 30 minutes, 0 = unlimited)"
+    )
+    parser.add_argument(
+        "--max-session-time",
+        type=int,
+        default=0,
+        metavar="SEC",
+        help="maximum total session time in seconds (default: 0 = unlimited)"
     )
     args = parser.parse_args()
 
