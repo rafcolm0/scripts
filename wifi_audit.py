@@ -51,6 +51,7 @@ import time
 import sys
 import re
 import curses
+import select
 from collections import deque
 from datetime import datetime
 from dataclasses import dataclass
@@ -640,13 +641,14 @@ class WifiAuditTUI:
 
             self.draw_output_window(y)
 
-            # Draw help footer showing skip key
+            # Draw help footer - only show skip hint during attack phase
             max_y, max_x = self.stdscr.getmaxyx()
-            help_text = "[s] Skip current target"
-            try:
-                self.stdscr.addstr(max_y - 1, 0, help_text[:max_x - 1], curses.A_DIM)
-            except curses.error:
-                pass
+            if not self.scan_phase:
+                help_text = "[s] Skip current target"
+                try:
+                    self.stdscr.addstr(max_y - 1, 0, help_text[:max_x - 1], curses.A_DIM)
+                except curses.error:
+                    pass
 
             # Use noutrefresh + doupdate for flicker-free refresh
             self.stdscr.noutrefresh()
@@ -1230,9 +1232,18 @@ def run_reaver_attack(target: AccessPoint, interface: str, result_obj: AttackRes
             # Monitor output
             last_refresh = time.time()
             while True:
-                line = proc.stdout.readline()
-                if not line and proc.poll() is not None:
-                    break
+                # Use select with timeout to allow keyboard input checking
+                ready, _, _ = select.select([proc.stdout], [], [], 0.1)
+
+                if ready:
+                    line = proc.stdout.readline()
+                    if not line and proc.poll() is not None:
+                        break
+                else:
+                    line = ""
+                    # Check if process ended
+                    if proc.poll() is not None:
+                        break
 
                 if line:
                     # Write ALL output to log file (complete reaver output)
