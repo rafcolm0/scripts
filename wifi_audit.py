@@ -154,19 +154,19 @@ class WPSResultsManager:
 
         bssid_key = bssid.upper()
         if bssid_key in self._results:
-            # Update existing - mark as "both" if was from wash
+            # Always update PWR/CH/WPS values for existing entries
             existing = self._results[bssid_key]
-            if existing.source == "wash":
-                self._results[bssid_key] = WPSAccessPoint(
-                    bssid=bssid,
-                    channel=channel,
-                    pwr=pwr,
-                    essid=essid or existing.essid,
-                    privacy=privacy or existing.privacy,
-                    wps_version=wps_version,
-                    wps_locked=is_locked,
-                    source="both"
-                )
+            new_source = "both" if existing.source == "wash" else existing.source
+            self._results[bssid_key] = WPSAccessPoint(
+                bssid=bssid,
+                channel=channel,
+                pwr=pwr,
+                essid=essid or existing.essid,
+                privacy=privacy or existing.privacy,
+                wps_version=wps_version,
+                wps_locked=is_locked,
+                source=new_source
+            )
         else:
             self._results[bssid_key] = WPSAccessPoint(
                 bssid=bssid,
@@ -191,31 +191,19 @@ class WPSResultsManager:
         bssid_key = bssid.upper()
 
         if bssid_key in self._results:
-            # Update existing - mark as "both" if was from airodump
+            # Always update PWR/CH/WPS values for existing entries
             existing = self._results[bssid_key]
-            if existing.source == "airodump":
-                self._results[bssid_key] = WPSAccessPoint(
-                    bssid=bssid,
-                    channel=channel or existing.channel,
-                    pwr=pwr if pwr != -999 else existing.pwr,
-                    essid=essid or existing.essid,
-                    privacy=existing.privacy,
-                    wps_version=version,
-                    wps_locked=locked,
-                    source="both"
-                )
-            else:
-                # Update wash entry with potentially better data
-                self._results[bssid_key] = WPSAccessPoint(
-                    bssid=bssid,
-                    channel=channel or existing.channel,
-                    pwr=pwr if pwr != -999 else existing.pwr,
-                    essid=essid or existing.essid,
-                    privacy=existing.privacy,
-                    wps_version=version,
-                    wps_locked=locked,
-                    source=existing.source
-                )
+            new_source = "both" if existing.source == "airodump" else existing.source
+            self._results[bssid_key] = WPSAccessPoint(
+                bssid=bssid,
+                channel=channel if channel else existing.channel,
+                pwr=pwr if pwr != -999 else existing.pwr,
+                essid=essid or existing.essid,
+                privacy=existing.privacy,
+                wps_version=version,
+                wps_locked=locked,
+                source=new_source
+            )
         else:
             self._results[bssid_key] = WPSAccessPoint(
                 bssid=bssid,
@@ -715,10 +703,11 @@ class WifiAuditTUI:
                     pass
                 return
 
-            # 's' key - skip/cancel current target
+            # 's' key - skip/cancel current target (only during attack phase)
             if key == ord('s'):
-                self.skip_current_target = True
-                self.add_output_line("[!] Skip requested - cancelling current target...")
+                if not self.scan_phase:
+                    self.skip_current_target = True
+                    self.add_output_line("[!] Skip requested - cancelling current target...")
                 return
 
             # Table scrolling (always active, no pane switching needed)
