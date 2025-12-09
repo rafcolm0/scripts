@@ -534,8 +534,9 @@ class WifiAuditTUI:
             return
 
         try:
-            # Clear screen
-            self.stdscr.clear()
+            # Use erase() instead of clear() to avoid flicker
+            # erase() just marks cells for overwrite, clear() causes visible blank
+            self.stdscr.erase()
 
             # Draw components
             y = 0
@@ -549,8 +550,9 @@ class WifiAuditTUI:
 
             self.draw_output_window(y)
 
-            # Refresh screen
-            self.stdscr.refresh()
+            # Use noutrefresh + doupdate for flicker-free refresh
+            self.stdscr.noutrefresh()
+            curses.doupdate()
 
         except curses.error as e:
             # Log curses errors - screen might be too small
@@ -588,130 +590,123 @@ def run_airodump_live(interface: str, duration: int, results_manager: WPSResults
                       tui=None) -> None:
     """Run airodump-ng and parse live output for WPS 1.0/2.0/Locked networks.
 
-    Parses stdout directly instead of CSV file. Only captures networks with
-    WPS version 1.0, 2.0, or Locked status.
+    Uses PTY to capture ncurses output (airodump doesn't output to stdout).
+    Only captures networks with WPS version 1.0, 2.0, or Locked status.
     """
+    import pty
+    import os
     import select
 
     tui_print(f"[+] Running airodump-ng for {duration} seconds (WPS 1.0/2.0/Locked only)...", tui)
 
-    # Run airodump-ng with --wps flag, capture stdout
-    # Use --berlin 0 to disable hop timeout warnings
+    # Create pseudo-terminal to capture airodump ncurses output
+    master_fd, slave_fd = pty.openpty()
+
+    # Run airodump-ng with --wps flag using PTY
     proc = subprocess.Popen(
         ["sudo", "timeout", str(duration),
          "airodump-ng", "--wps", "-a", "--berlin", "0", interface],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        bufsize=1
+        stdout=slave_fd,
+        stderr=slave_fd,
+        stdin=subprocess.DEVNULL
     )
+    os.close(slave_fd)  # Close slave in parent process
 
     # Regex to strip ANSI escape codes
-    ansi_escape = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]|\x1b\[[\?0-9;]*[a-zA-Z]')
+    ansi_escape = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]|\x1b\[[\?0-9;]*[a-zA-Z]|\x1b\[\d*[A-Za-z]')
 
     # Regex pattern to parse airodump output line
     # Format: BSSID  PWR  Beacons  #Data  #/s  CH  MB  ENC  CIPHER  AUTH  WPS  ESSID
     # Example: AA:BB:CC:DD:EE:FF  -45  100  50  0  6  54e  WPA2  CCMP  PSK  2.0  NetworkName
     ap_pattern = re.compile(
-        r'^([0-9A-Fa-f:]{17})\s+'  # BSSID
+        r'([0-9A-Fa-f:]{17})\s+'  # BSSID
         r'(-?\d+)\s+'              # PWR
         r'\d+\s+'                  # Beacons
         r'\d+\s+'                  # #Data
         r'\d+\s+'                  # #/s
         r'(\d+)\s+'                # CH (channel)
         r'[\d\w.e-]+\s+'           # MB (speed)
-        r'(\S*)\s*'                # ENC (encryption)
-        r'(\S*)\s*'                # CIPHER
-        r'(\S*)\s*'                # AUTH
-        r'([\d.]+|Locked|Lck|No|)\s*'  # WPS
+        r'(\S+)\s+'                # ENC (encryption)
+        r'(\S+)\s+'                # CIPHER
+        r'(\S+)\s+'                # AUTH
+        r'([\d.]+|Locked|Lck|No)\s*'  # WPS
         r'(.*)$'                   # ESSID
     )
 
     start = time.time()
     bar_width = 40
-    total_scanned = 0
+    buffer = ""
 
-    while proc.poll() is None:
-        elapsed = int(time.time() - start)
-        progress = min(elapsed / duration, 1)
-        filled = int(bar_width * progress)
-        bar = "█" * filled + "░" * (bar_width - filled)
-        percent = int(progress * 100)
-
-        # Try to read available output (non-blocking)
-        try:
-            ready, _, _ = select.select([proc.stdout], [], [], 0.1)
-            if ready:
-                line = proc.stdout.readline()
-                if line:
-                    decoded = line.decode(errors='ignore')
-                    # Strip ANSI codes
-                    clean_line = ansi_escape.sub('', decoded).strip()
-
-                    # Skip header lines
-                    if not clean_line or 'BSSID' in clean_line or 'PWR' in clean_line:
-                        continue
-
-                    # Try to parse AP line
-                    match = ap_pattern.match(clean_line)
-                    if match:
-                        bssid, pwr, channel, enc, cipher, auth, wps, essid = match.groups()
-                        total_scanned += 1
-
-                        # Only add if WPS is 1.0, 2.0, or Locked
-                        if wps in ('1.0', '2.0', 'Locked', 'Lck'):
-                            pwr_int = int(pwr) if pwr else -999
-                            results_manager.add_from_airodump(
-                                bssid=bssid,
-                                channel=channel,
-                                pwr=pwr_int,
-                                essid=essid.strip(),
-                                privacy=enc,
-                                wps_value=wps
-                            )
-        except Exception:
-            pass
-
-        # Update progress bar
-        wps_count = results_manager.get_count()
-        msg = f"[SCAN] |{bar}| {percent}% ({elapsed}/{duration}s) | WPS 1.0/2.0/Locked: {wps_count}"
-
-        if tui and tui.enabled:
-            tui.scan_results = results_manager.get_as_dict_list()
-            tui.update_progress_line(msg, "[SCAN]")
-            dummy_stats = {'total': 0, 'completed': 0, 'success': 0, 'failed': 0, 'locked': 0}
-            tui.refresh_display([], dummy_stats)
-        else:
-            print(f"\r{msg}", end="", flush=True)
-
-        if elapsed >= duration:
-            break
-        time.sleep(0.3)
-
-    # Read any remaining output
     try:
-        remaining_out, _ = proc.communicate(timeout=2)
-        if remaining_out:
-            for line in remaining_out.decode(errors='ignore').splitlines():
-                clean_line = ansi_escape.sub('', line).strip()
-                if not clean_line or 'BSSID' in clean_line:
-                    continue
-                match = ap_pattern.match(clean_line)
-                if match:
-                    bssid, pwr, channel, enc, cipher, auth, wps, essid = match.groups()
-                    if wps in ('1.0', '2.0', 'Locked', 'Lck'):
-                        pwr_int = int(pwr) if pwr else -999
-                        results_manager.add_from_airodump(
-                            bssid=bssid,
-                            channel=channel,
-                            pwr=pwr_int,
-                            essid=essid.strip(),
-                            privacy=enc,
-                            wps_value=wps
-                        )
-    except subprocess.TimeoutExpired:
-        proc.kill()
-    except Exception:
-        pass
+        while proc.poll() is None:
+            elapsed = int(time.time() - start)
+            progress = min(elapsed / duration, 1)
+            filled = int(bar_width * progress)
+            bar = "█" * filled + "░" * (bar_width - filled)
+            percent = int(progress * 100)
+
+            # Try to read available output from PTY (non-blocking)
+            try:
+                ready, _, _ = select.select([master_fd], [], [], 0.3)
+                if ready:
+                    data = os.read(master_fd, 8192).decode(errors='ignore')
+                    buffer += data
+
+                    # Process complete lines in buffer
+                    while '\n' in buffer:
+                        line, buffer = buffer.split('\n', 1)
+                        # Strip ANSI codes
+                        clean_line = ansi_escape.sub('', line).strip()
+
+                        # Skip empty or header lines
+                        if not clean_line or 'BSSID' in clean_line or 'PWR' in clean_line:
+                            continue
+                        if 'CH' in clean_line and 'MB' in clean_line:
+                            continue
+
+                        # Try to parse AP line
+                        match = ap_pattern.search(clean_line)
+                        if match:
+                            bssid, pwr, channel, enc, cipher, auth, wps, essid = match.groups()
+
+                            # Only add if WPS is 1.0, 2.0, or Locked
+                            if wps in ('1.0', '2.0', 'Locked', 'Lck'):
+                                pwr_int = int(pwr) if pwr else -999
+                                results_manager.add_from_airodump(
+                                    bssid=bssid,
+                                    channel=channel,
+                                    pwr=pwr_int,
+                                    essid=essid.strip(),
+                                    privacy=enc,
+                                    wps_value=wps
+                                )
+            except OSError:
+                # PTY closed
+                break
+            except Exception:
+                pass
+
+            # Update progress bar
+            wps_count = results_manager.get_count()
+            msg = f"[SCAN] |{bar}| {percent}% ({elapsed}/{duration}s) | WPS 1.0/2.0/Locked: {wps_count}"
+
+            if tui and tui.enabled:
+                tui.scan_results = results_manager.get_as_dict_list()
+                tui.update_progress_line(msg, "[SCAN]")
+                dummy_stats = {'total': 0, 'completed': 0, 'success': 0, 'failed': 0, 'locked': 0}
+                tui.refresh_display([], dummy_stats)
+            else:
+                print(f"\r{msg}", end="", flush=True)
+
+            if elapsed >= duration:
+                break
+
+    finally:
+        # Clean up PTY
+        try:
+            os.close(master_fd)
+        except OSError:
+            pass
 
     proc.wait()
 
@@ -741,12 +736,11 @@ def run_wash(interface: str, duration: int, results_manager: WPSResultsManager,
 
     tui_print(f"[+] Running wash for {duration} seconds (WPS 1.0/2.0/Locked only)...", tui)
 
-    # Run wash in background with line-buffered output
+    # Run wash in background
     proc = subprocess.Popen(
         ["timeout", str(duration), "wash", "-i", interface],
         stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        bufsize=1  # Line buffered
+        stderr=subprocess.DEVNULL
     )
 
     # Show progress bar while scanning, reading output incrementally
