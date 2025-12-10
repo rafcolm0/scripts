@@ -437,7 +437,10 @@ class WifiAuditTUI:
                         progress = "Initializing..."
                     color = curses.color_pair(5)  # Magenta
                 elif result.status == "SUCCESS":
-                    progress = f"SUCCESS | PIN: {result.wps_pin}"
+                    if result.password and result.password != "-":
+                        progress = f"SUCCESS | PIN: {result.wps_pin} | PSK: {result.password}"
+                    else:
+                        progress = f"SUCCESS | PIN: {result.wps_pin}"
                     color = curses.color_pair(1)  # Green
                 elif result.status == "LOCKED":
                     progress = "LOCKED (rate limiting)"
