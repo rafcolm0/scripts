@@ -671,72 +671,75 @@ class WifiAuditTUI:
         if not self.enabled:
             return
 
-        try:
-            key = self.stdscr.getch()
-            if key == -1:
-                return  # No input
+        # Process up to 20 pending events to make scrolling responsive
+        # without risking infinite loop if key is held down
+        for _ in range(20):
+            try:
+                key = self.stdscr.getch()
+                if key == -1:
+                    return  # No more input
 
-            # Calculate visible rows for table
-            table_visible_rows = max(1, self.table_end_y - self.table_start_y - 2)
+                # Calculate visible rows for table
+                table_visible_rows = max(1, self.table_end_y - self.table_start_y - 2)
 
-            # Handle mouse events (only for table scrolling)
-            if key == curses.KEY_MOUSE:
-                try:
-                    _, mx, my, _, bstate = curses.getmouse()
+                # Handle mouse events (only for table scrolling)
+                if key == curses.KEY_MOUSE:
+                    try:
+                        _, mx, my, _, bstate = curses.getmouse()
 
-                    # Only scroll if mouse is over table area
-                    mouse_in_table = self.table_start_y <= my < self.table_end_y
+                        # Only scroll if mouse is over table area
+                        mouse_in_table = self.table_start_y <= my < self.table_end_y
 
-                    if mouse_in_table:
-                        max_offset = max(0, self.table_total_items - table_visible_rows)
+                        if mouse_in_table:
+                            max_offset = max(0, self.table_total_items - table_visible_rows)
 
-                        # Scroll wheel up (button 4)
-                        if bstate & curses.BUTTON4_PRESSED:
-                            self.table_scroll_offset = max(0, self.table_scroll_offset - 3)
-                        # Scroll wheel down (button 5)
-                        elif bstate & (curses.BUTTON5_PRESSED if hasattr(curses, 'BUTTON5_PRESSED') else 0x200000):
-                            self.table_scroll_offset = min(max_offset, self.table_scroll_offset + 3)
-                        # Alternative scroll detection
-                        elif bstate & 0x10000:
-                            self.table_scroll_offset = max(0, self.table_scroll_offset - 3)
-                        elif bstate & 0x200000:
-                            self.table_scroll_offset = min(max_offset, self.table_scroll_offset + 3)
+                            # Scroll wheel up (button 4)
+                            if bstate & curses.BUTTON4_PRESSED:
+                                self.table_scroll_offset = max(0, self.table_scroll_offset - 3)
+                            # Scroll wheel down (button 5)
+                            elif bstate & (curses.BUTTON5_PRESSED if hasattr(curses, 'BUTTON5_PRESSED') else 0x200000):
+                                self.table_scroll_offset = min(max_offset, self.table_scroll_offset + 3)
+                            # Alternative scroll detection
+                            elif bstate & 0x10000:
+                                self.table_scroll_offset = max(0, self.table_scroll_offset - 3)
+                            elif bstate & 0x200000:
+                                self.table_scroll_offset = min(max_offset, self.table_scroll_offset + 3)
 
-                except curses.error:
-                    pass
-                return
+                    except curses.error:
+                        pass
+                    continue  # Process next event
 
-            # 's' key - skip/cancel current target (only during attack phase)
-            if key == ord('s'):
-                if not self.scan_phase:
-                    self.skip_current_target = True
-                    self.add_output_line("[!] Skip requested - cancelling current target...")
-                return
+                # 's' key - skip/cancel current target (only during attack phase)
+                if key == ord('s'):
+                    if not self.scan_phase:
+                        self.skip_current_target = True
+                        self.add_output_line("[!] Skip requested - cancelling current target...")
+                    continue  # Process next event
 
-            # Table scrolling (always active, no pane switching needed)
-            max_offset = max(0, self.table_total_items - table_visible_rows)
+                # Table scrolling (always active, no pane switching needed)
+                max_offset = max(0, self.table_total_items - table_visible_rows)
 
-            # Up arrow or 'k'
-            if key in (curses.KEY_UP, ord('k')):
-                self.table_scroll_offset = max(0, self.table_scroll_offset - 1)
-            # Down arrow or 'j'
-            elif key in (curses.KEY_DOWN, ord('j')):
-                self.table_scroll_offset = min(max_offset, self.table_scroll_offset + 1)
-            # Page Up
-            elif key == curses.KEY_PPAGE:
-                self.table_scroll_offset = max(0, self.table_scroll_offset - table_visible_rows)
-            # Page Down
-            elif key == curses.KEY_NPAGE:
-                self.table_scroll_offset = min(max_offset, self.table_scroll_offset + table_visible_rows)
-            # Home
-            elif key == curses.KEY_HOME:
-                self.table_scroll_offset = 0
-            # End
-            elif key == curses.KEY_END:
-                self.table_scroll_offset = max_offset
+                # Up arrow or 'k'
+                if key in (curses.KEY_UP, ord('k')):
+                    self.table_scroll_offset = max(0, self.table_scroll_offset - 1)
+                # Down arrow or 'j'
+                elif key in (curses.KEY_DOWN, ord('j')):
+                    self.table_scroll_offset = min(max_offset, self.table_scroll_offset + 1)
+                # Page Up
+                elif key == curses.KEY_PPAGE:
+                    self.table_scroll_offset = max(0, self.table_scroll_offset - table_visible_rows)
+                # Page Down
+                elif key == curses.KEY_NPAGE:
+                    self.table_scroll_offset = min(max_offset, self.table_scroll_offset + table_visible_rows)
+                # Home
+                elif key == curses.KEY_HOME:
+                    self.table_scroll_offset = 0
+                # End
+                elif key == curses.KEY_END:
+                    self.table_scroll_offset = max_offset
 
-        except curses.error:
-            pass
+            except curses.error:
+                pass
 
 
 # ---------------------------------------------------------
