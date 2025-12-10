@@ -1653,6 +1653,77 @@ def print_results_table(results: List[AttackResult]):
     print("+" + "-" * 4 + "+" + "-" * 19 + "+" + "-" * 22 + "+" + "-" * 10 + "+" + "-" * 11 + "+" + "-" * 14 + "+" + "-" * 10 + "+")
 
 
+def print_simple_results(results: List[AttackResult]):
+    """Print simple results summary to terminal (ESSID, BSSID, Result only)."""
+    if not results:
+        return
+
+    print("\n" + "=" * 60)
+    print("=== Attack Results Summary ===")
+    print("=" * 60)
+
+    # Header
+    print(f"{'ESSID':<25} | {'BSSID':<17} | {'Result':<12}")
+    print("-" * 60)
+
+    # Rows
+    for result in results:
+        essid = result.essid[:25] if result.essid else '<Hidden>'
+        print(f"{essid:<25} | {result.bssid:<17} | {result.status:<12}")
+
+    print("-" * 60)
+
+    # Summary counts
+    success_count = sum(1 for r in results if r.status == "SUCCESS")
+    print(f"\nTotal: {len(results)} | Success: {success_count}")
+    print()
+
+
+def write_results_table_file(results: List[AttackResult], filename: str) -> str:
+    """Write full detailed results table to file.
+
+    Args:
+        results: List of AttackResult objects
+        filename: Output filename
+
+    Returns:
+        Full path to created file
+    """
+    success_count = sum(1 for r in results if r.status == "SUCCESS")
+    failed_count = sum(1 for r in results if r.status == "FAILED")
+    locked_count = sum(1 for r in results if r.status == "LOCKED")
+    cancelled_count = sum(1 for r in results if r.status == "CANCELLED")
+    timeout_count = sum(1 for r in results if r.status == "TIMEOUT")
+
+    with open(filename, 'w') as f:
+        f.write(f"WiFi WPS Attack Results - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write("=" * 100 + "\n\n")
+
+        f.write(f"Total Targets: {len(results)}\n")
+        f.write(f"Successful: {success_count}\n")
+        f.write(f"Failed: {failed_count}\n")
+        f.write(f"Locked: {locked_count}\n")
+        f.write(f"Cancelled: {cancelled_count}\n")
+        f.write(f"Timeout: {timeout_count}\n\n")
+
+        f.write("Detailed Results:\n")
+        f.write("+" + "-" * 4 + "+" + "-" * 19 + "+" + "-" * 22 + "+" + "-" * 10 + "+" + "-" * 11 + "+" + "-" * 14 + "+" + "-" * 10 + "+\n")
+        f.write("| #  | BSSID             | ESSID                | Status   | WPS PIN   | Password     | Time     |\n")
+        f.write("+" + "-" * 4 + "+" + "-" * 19 + "+" + "-" * 22 + "+" + "-" * 10 + "+" + "-" * 11 + "+" + "-" * 14 + "+" + "-" * 10 + "+\n")
+
+        for result in results:
+            mins, secs = divmod(int(result.time_spent), 60)
+            time_str = f"{mins}m {secs}s"
+            essid = result.essid[:20] if result.essid else '<Hidden>'
+            password = result.password[:12] if result.password else '-'
+
+            f.write(f"| {result.target_num:<2} | {result.bssid:<17} | {essid:<20} | {result.status:<8} | {result.wps_pin:<9} | {password:<12} | {time_str:<8} |\n")
+
+        f.write("+" + "-" * 4 + "+" + "-" * 19 + "+" + "-" * 22 + "+" + "-" * 10 + "+" + "-" * 11 + "+" + "-" * 14 + "+" + "-" * 10 + "+\n")
+
+    return filename
+
+
 # ---------------------------------------------------------
 # Main
 # ---------------------------------------------------------
@@ -1839,12 +1910,20 @@ def run_main_logic(args, tui=None):
         # Disable TUI to allow normal printing
         tui.enabled = False
 
-    # Display final results
-    print_results_table(results)
+    # Display final results (legacy mode only - curses mode prints after wrapper exits)
+    if tui is None:
+        print_results_table(results)
 
     # Save attack results to file
     log_filename = f"wifi_audit_results_{timestamp}.txt"
     save_results_to_file(results, args.interface, log_filename)
+
+    # Write full detailed results table to separate file
+    results_table_filename = f"results_table_{timestamp}.txt"
+    write_results_table_file(results, results_table_filename)
+    print(f"[+] Results table saved to: {results_table_filename}")
+
+    return results
 
 
 def main():
@@ -1990,12 +2069,15 @@ def main():
     # Decide whether to use curses or not
     use_curses = not args.no_curses and not args.passive
 
+    # Container to capture results from curses wrapper
+    final_results = [None]
+
     if use_curses:
         # Run with curses TUI
         def curses_main(stdscr):
             tui = WifiAuditTUI(stdscr)
             try:
-                run_main_logic(args, tui)
+                final_results[0] = run_main_logic(args, tui)
             except KeyboardInterrupt:
                 tui.enabled = False
                 print("\n[!] Interrupted by user")
@@ -2006,6 +2088,9 @@ def main():
 
         try:
             curses.wrapper(curses_main)
+            # After curses exits, print simple results summary to terminal
+            if final_results[0]:
+                print_simple_results(final_results[0])
         except Exception as e:
             print(f"[!] Curses initialization failed: {e}")
             print("[!] Falling back to legacy mode...")
