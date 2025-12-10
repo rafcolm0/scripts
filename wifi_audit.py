@@ -1970,9 +1970,9 @@ def main():
     parser.add_argument(
         "--max-target-time",
         type=int,
-        default=1800,
+        default=0,
         metavar="SEC",
-        help="maximum time per target in seconds (default: 1800 = 30 minutes, 0 = unlimited)"
+        help="maximum time per target in seconds (default: 0 = unlimited)"
     )
     parser.add_argument(
         "--max-session-time",
