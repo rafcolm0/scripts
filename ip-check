@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+import json
+import sys
+import urllib.request
+import urllib.error
+
+UA = "ipinfo-cli/1.1"
+
+def eprint(*args):
+    print(*args, file=sys.stderr, flush=True)
+
+def get(url, timeout=10):
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+def main():
+    # Confirmación de arranque (para que nunca sea "silencioso")
+    # Puedes comentar esta línea luego si no la quieres.
+    # eprint("[debug] running ip-check...")
+
+    # llamada simbólica a whatismyip.com
+    try:
+        get("https://www.whatismyip.com/", timeout=10)
+    except Exception as ex:
+        eprint(f"[warn] whatismyip.com no respondió: {ex}")
+
+    # IP pública
+    try:
+        ip = json.loads(get("https://api.ipify.org?format=json", timeout=10).decode("utf-8"))["ip"]
+    except Exception as ex:
+        eprint(f"[error] no pude obtener tu IP pública (ipify): {ex}")
+        return 2
+
+    # Geo lookup
+    fields = ",".join([
+        "status","message","query","continent","continentCode",
+        "country","countryCode","region","regionName",
+        "city","district","zip","lat","lon",
+        "timezone","offset","isp","org","as","asname"
+    ])
+
+    try:
+        geo = json.loads(get(f"http://ip-api.com/json/{ip}?fields={fields}", timeout=10).decode("utf-8"))
+    except Exception as ex:
+        eprint(f"[error] no pude obtener geolocalización (ip-api): {ex}")
+        eprint(f"[info] tu IP pública es: {ip}")
+        return 3
+
+    if geo.get("status") != "success":
+        eprint(f"[error] ip-api respondió status != success: {geo.get('message')}")
+        eprint(f"[info] tu IP pública es: {ip}")
+        return 4
+
+    output = {
+        "ip": ip,
+        "city": geo.get("city"),
+        "region": geo.get("regionName"),
+        "country": geo.get("country"),
+        "continent": geo.get("continent"),
+        "lat": geo.get("lat"),
+        "lon": geo.get("lon"),
+        "timezone": geo.get("timezone"),
+        "isp": geo.get("isp"),
+        "org": geo.get("org"),
+        "asn": geo.get("as"),
+        "asn_name": geo.get("asname"),
+    }
+
+    print(json.dumps(output, indent=2, ensure_ascii=False), flush=True)
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
