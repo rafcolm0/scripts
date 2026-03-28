@@ -34,6 +34,23 @@ Usage:
     # Custom scan duration:
     sudo python3 wifi_audit.py -i wlan0mon -a 120
 
+Setup (Ubuntu):
+    # Install dependencies
+    sudo apt update && sudo apt install -y python3 aircrack-ng reaver wireless-tools
+
+    # Kill processes that interfere with monitor mode
+    sudo airmon-ng check kill
+
+    # Enable monitor mode (replace wlan0 with your adapter)
+    sudo airmon-ng start wlan0
+
+    # Run the script (interface is usually wlan0mon after enabling monitor mode)
+    sudo python3 wifi_audit.py -i wlan0mon
+
+    # When done, disable monitor mode and restart networking
+    sudo airmon-ng stop wlan0mon
+    sudo systemctl restart NetworkManager
+
 Requires:
     - airodump-ng (from aircrack-ng)
     - wash (from reaver)
