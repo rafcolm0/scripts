@@ -1,0 +1,7 @@
+config.yaml
+movies.txt
+*.db
+*.db.lock
+*.log
+__pycache__/
+venv/

@@ -1,0 +1,17 @@
+[Unit]
+Description=movie-grabber: automatic movie downloads for Plex
+After=network-online.target qbittorrent-nox.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+# Secrets (QB_PASSWORD, SMTP_PASSWORD, PLEX_TOKEN, ...) live here, chmod 600.
+EnvironmentFile=-/etc/movie-grabber.env
+ExecStart=/opt/movie-grabber/venv/bin/python -m movie_grabber -c /etc/movie-grabber/config.yaml run
+WorkingDirectory=/opt/movie-grabber
+Restart=on-failure
+RestartSec=60
+
+[Install]
+WantedBy=multi-user.target

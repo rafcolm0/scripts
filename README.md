@@ -20,3 +20,7 @@ Input example: ./connGs 5 0 1 1 4 2 3 1 3 3 4 -1, refers to a graph of 5 vertice
 
 #III) iptabler_ 
 script for adding iptables rules.  Requires a formatted .txt file called "iptabler_rules.txt", with valid iptable rules and comments beginning with character "#".  See example for details.
+
+
+#IV) movie-grabber
+Python app that watches a list of movie titles, searches torrent sites on a schedule (X times every Y hours/days) for 1080p BluRay/WEB (VOD) rips from preferred groups (YTS, YIFY, ...), downloads them with qBittorrent, files them into the Plex library as "Title (Year)/Title (Year).ext" and emails you when done. See movie-grabber/README.md for setup (Ubuntu + systemd).

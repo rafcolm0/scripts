@@ -1,0 +1,100 @@
+# movie-grabber configuration
+# Copy to ~/.config/movie-grabber/config.yaml and edit.
+# Any value can reference environment variables: password: "${QB_PASSWORD}"
+# Relative paths are relative to this file's directory.
+
+movies_file: movies.txt          # one title per line: "The Matrix (1999)"  (optionally "@library")
+state_db: movie-grabber.db
+log_file: movie-grabber.log      # remove to log to stdout/journald only
+
+schedule:
+  # Search X times every Y  ->  runs: 4, every: 1d  = search every 6 hours.
+  # Durations: 30s, 15m, 6h, 1d, 1w
+  runs: 4
+  every: 1d
+  check_downloads_every: 5m      # how often finished downloads are picked up
+  max_search_attempts: 0         # stop searching a title after N misses (0 = keep trying forever)
+  delay_between_searches: 3s     # be polite to the sites
+  stalled_after: 3d              # drop + blacklist a release that hasn't finished by then (0 = never)
+
+quality:
+  resolutions: [1080p]
+  # Allowed sources, in order of preference:
+  #   bluray = BluRay / BRRip / BDRip
+  #   web    = WEB-DL / WEBRip / VOD rips (AMZN, NF, DSNP, iTunes, ...)
+  sources: [bluray, web]
+  # Release groups / uploaders, in order of preference (whole-word match in the release name).
+  preferred_groups: [YTS, YIFY, RARBG, GalaxyRG, QxR]
+  require_preferred_group: true
+  accept_untagged_source_from_preferred_groups: true   # e.g. "Movie (2020) [1080p] [YTS.MX]"
+  exclude_keywords: [cam, hdcam, camrip, ts, hdts, telesync, tc, telecine, scr, screener,
+                     dvdscr, r5, workprint, hc, hardcoded, 3d, sample, trailer]
+  preferred_codec: x264          # tie-breaker only: x264 | x265 | null
+  min_seeders: 3
+  min_size_gb: 0.4
+  max_size_gb: 20
+
+# Where to search. Results from all enabled sources are pooled and the best release wins.
+sources:
+  - type: yts                    # YTS/YIFY JSON API
+    name: YTS
+    enabled: true
+    base_url: https://yts.mx     # change if the domain moves
+
+  - type: apibay                 # The Pirate Bay JSON API
+    name: TPB
+    enabled: true
+    base_url: https://apibay.org
+
+  # Any site supported by Jackett or Prowlarr (1337x, TorrentGalaxy, EZTV, LimeTorrents, ...).
+  # Add one entry per indexer, or use Jackett's "all" aggregate endpoint.
+  # - type: torznab
+  #   name: Jackett-all
+  #   url: http://localhost:9117/api/v2.0/indexers/all/results/torznab/api
+  #   api_key: "${JACKETT_API_KEY}"
+  #   categories: [2000]         # 2000 = Movies
+  # - type: torznab
+  #   name: Prowlarr-1337x
+  #   url: http://localhost:9696/1/api   # Prowlarr: Indexers -> (indexer) -> copy Torznab URL
+  #   api_key: "${PROWLARR_API_KEY}"
+
+qbittorrent:
+  url: http://localhost:8080     # WebUI: Tools > Options > Web UI
+  username: admin
+  password: "${QB_PASSWORD}"
+  category: movie-grabber        # created automatically
+  tag: movie-grabber
+  save_path: null                # null = qBittorrent's default download folder
+  # If qBittorrent runs in Docker, map its paths to host paths:
+  # path_map:
+  #   /downloads: /mnt/storage/downloads
+
+library:
+  roots:                         # Plex movie library folders
+    default: /srv/media/Movies
+    # kids: /srv/media/Kids Movies   # use with "Frozen (2013) @kids" in movies.txt
+  # move     = move out of the download folder, remove the torrent (stops seeding)
+  # hardlink = instant, no extra space, keeps seeding (download + library on the same filesystem)
+  # copy     = duplicate the file
+  transfer: move
+  remove_torrent: true           # for copy/hardlink: remove torrent + download files after import
+  skip_if_in_library: true       # don't download titles already present as "Title (Year)"
+  file_mode: "0664"              # make files readable by the plex user
+  dir_mode: "0775"
+
+plex:                            # optional: trigger a library scan right after import
+  url: null                      # e.g. http://localhost:32400
+  token: "${PLEX_TOKEN}"         # https://support.plex.tv/articles/204059436
+  section_ids: []                # empty = refresh all libraries
+
+email:
+  enabled: true
+  smtp_host: smtp.gmail.com
+  smtp_port: 587
+  security: starttls             # starttls (587) | ssl (465) | none
+  username: you@gmail.com
+  password: "${SMTP_PASSWORD}"   # Gmail: create an App Password (Google Account > Security)
+  from: you@gmail.com
+  to: [you@gmail.com]
+  notify_on_added: false         # also email when a download starts
+  notify_on_failure: true        # email when an import fails or a release is dropped

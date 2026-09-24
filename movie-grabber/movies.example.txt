@@ -1,0 +1,9 @@
+# One movie per line. Include the year in parentheses for accurate matching.
+# Optional "@name" at the end picks a library from library.roots in config.yaml.
+# Lines starting with # are ignored; the file is re-read on every run, so just edit it.
+
+The Matrix (1999)
+Heat (1995)
+Blade Runner 2049 (2017)
+Dune: Part Two (2024)
+# Frozen (2013) @kids      <- needs a "kids" entry under library.roots
