@@ -7,7 +7,7 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-WANTED, DOWNLOADING, COMPLETED, FAILED, GAVE_UP = "wanted", "downloading", "completed", "failed", "gave_up"
+WANTED, DOWNLOADING, COMPLETED, GAVE_UP = "wanted", "downloading", "completed", "gave_up"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS movies (

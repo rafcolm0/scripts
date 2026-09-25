@@ -34,8 +34,8 @@ def make_magnet(info_hash: str, name: str, trackers: list[str] | None = None) ->
 def make_session(http_cfg: dict[str, Any]) -> requests.Session:
     s = requests.Session()
     s.headers["User-Agent"] = http_cfg["user_agent"]
-    retry = Retry(total=3, backoff_factor=2, status_forcelist=(429, 500, 502, 503, 504),
-                  allowed_methods=("GET", "POST"))
+    # urllib3's default retryable methods already cover GET, the only method these sessions use.
+    retry = Retry(total=3, backoff_factor=2, status_forcelist=(429, 500, 502, 503, 504))
     s.mount("http://", HTTPAdapter(max_retries=retry))
     s.mount("https://", HTTPAdapter(max_retries=retry))
     return s

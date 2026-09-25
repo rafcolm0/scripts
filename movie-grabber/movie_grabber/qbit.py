@@ -96,7 +96,8 @@ class QbitClient:
                 return found[0]
         if tag:
             # Filter client-side: works on qBittorrent versions without ?tag=.
-            for t in self.torrents(category=self.cfg["category"]) if self.cfg.get("category") else self.torrents():
+            filters = {"category": self.cfg["category"]} if self.cfg.get("category") else {}
+            for t in self.torrents(**filters):
                 if tag in [x.strip() for x in (t.get("tags") or "").split(",")]:
                     return t
         return None

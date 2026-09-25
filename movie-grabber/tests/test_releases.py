@@ -46,6 +46,10 @@ class WantedLineTests(unittest.TestCase):
         self.assertIsNone(parse_wanted_line("# comment"))
         self.assertIsNone(parse_wanted_line("   "))
 
+    def test_display_and_query(self):
+        self.assertEqual((WantedMovie("Heat", 1995).display, WantedMovie("Heat", 1995).query), ("Heat (1995)", "Heat 1995"))
+        self.assertEqual((WantedMovie("Heat").display, WantedMovie("Heat").query), ("Heat", "Heat"))
+
 
 class EvaluateTests(unittest.TestCase):
     movie = WantedMovie("The Matrix", 1999)

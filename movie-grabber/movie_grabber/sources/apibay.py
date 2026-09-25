@@ -14,10 +14,9 @@ class ApibaySource(Source):
 
     def search(self, movie: WantedMovie) -> list[SearchResult]:
         base = self.cfg.get("base_url", "https://apibay.org").rstrip("/")
-        query = f"{movie.title} {movie.year}" if movie.year else movie.title
         resp = self.session.get(
             f"{base}/q.php",
-            params={"q": query, "cat": self.cfg.get("category", _DEFAULT_CATEGORY)},
+            params={"q": movie.query, "cat": self.cfg.get("category", _DEFAULT_CATEGORY)},
             timeout=self.timeout,
         )
         resp.raise_for_status()

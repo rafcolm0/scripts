@@ -1,6 +1,6 @@
 [Unit]
 Description=movie-grabber: automatic movie downloads for Plex
-After=network-online.target qbittorrent-nox.service
+After=network-online.target qbittorrent-nox@%i.service
 Wants=network-online.target
 
 [Service]

@@ -17,6 +17,8 @@ from typing import Any, Optional
 
 import requests
 
+from .releases import display_name
+
 log = logging.getLogger(__name__)
 
 VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".m4v", ".mov", ".wmv", ".mpg", ".mpeg", ".webm"}
@@ -29,7 +31,7 @@ _LANGS = {
     "korean": "ko", "arabic": "ar", "swedish": "sv", "danish": "da", "norwegian": "no",
     "finnish": "fi", "polish": "pl", "greek": "el", "turkish": "tr", "hebrew": "he",
 }
-_ISO2 = set(v for v in _LANGS.values() if len(v) == 2)
+_ISO2 = {v for v in _LANGS.values() if len(v) == 2}
 
 
 def safe_name(text: str) -> str:
@@ -39,7 +41,7 @@ def safe_name(text: str) -> str:
 
 
 def folder_name(title: str, year: Optional[int]) -> str:
-    return safe_name(f"{title} ({year})" if year else title)
+    return safe_name(display_name(title, year))
 
 
 def _sub_language(path: Path) -> Optional[str]:
@@ -138,7 +140,8 @@ def refresh_plex(plex_cfg: dict[str, Any], timeout: float = 30) -> None:
     base = plex_cfg["url"].rstrip("/")
     sections = plex_cfg.get("section_ids") or ["all"]
     for sid in sections:
+        # Token goes in a header, not the query string, so it never shows up in logged error URLs.
         r = requests.get(f"{base}/library/sections/{sid}/refresh",
-                         params={"X-Plex-Token": plex_cfg["token"]}, timeout=timeout)
+                         headers={"X-Plex-Token": plex_cfg["token"]}, timeout=timeout)
         r.raise_for_status()
     log.info("Asked Plex to refresh library section(s): %s", ", ".join(map(str, sections)))

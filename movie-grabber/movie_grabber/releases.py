@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Optional
 
 _YEAR_RE = re.compile(r"(?<!\d)(19\d{2}|20\d{2})(?!\d)")
@@ -103,7 +103,6 @@ class SearchResult:
     magnet: Optional[str] = None
     torrent_url: Optional[str] = None
     info_hash: Optional[str] = None    # lower-case hex, if known
-    extra: dict[str, Any] = field(default_factory=dict)
 
     @property
     def download_ref(self) -> Optional[str]:
@@ -119,6 +118,11 @@ class Evaluation:
     sort_key: tuple = ()
 
 
+def display_name(title: str, year: Optional[int]) -> str:
+    """Format as "Title (Year)", or just the title when the year is unknown."""
+    return f"{title} ({year})" if year else title
+
+
 @dataclass
 class WantedMovie:
     title: str
@@ -131,7 +135,12 @@ class WantedMovie:
 
     @property
     def display(self) -> str:
-        return f"{self.title} ({self.year})" if self.year else self.title
+        return display_name(self.title, self.year)
+
+    @property
+    def query(self) -> str:
+        """Search string for the torrent sites: "Title Year"."""
+        return f"{self.title} {self.year}" if self.year else self.title
 
 
 _LINE_RE = re.compile(r"^(?P<title>.+?)\s*(?:[(\[](?P<year>(?:19|20)\d{2})[)\]])?\s*(?:@(?P<lib>[\w-]+))?\s*$")
@@ -160,11 +169,8 @@ def title_matches(wanted: WantedMovie, parsed: ParsedRelease) -> bool:
     # "The Matrix" and "Matrix" are treated as the same title.
     if strip_article(normalize(wanted.title)) != strip_article(parsed.title):
         return False
-    if wanted.year and parsed.year and wanted.year != parsed.year:
-        return False
-    if wanted.year and not parsed.year:
-        return False
-    return True
+    # A wanted year must match exactly; a release without a year can't be verified.
+    return not wanted.year or parsed.year == wanted.year
 
 
 def evaluate(result: SearchResult, wanted: WantedMovie, quality: dict[str, Any],

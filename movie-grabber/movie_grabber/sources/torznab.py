@@ -14,8 +14,7 @@ class TorznabSource(Source):
     type = "torznab"
 
     def search(self, movie: WantedMovie) -> list[SearchResult]:
-        query = f"{movie.title} {movie.year}" if movie.year else movie.title
-        params = {"t": "search", "q": query}
+        params = {"t": "search", "q": movie.query}
         if self.cfg.get("api_key"):
             params["apikey"] = self.cfg["api_key"]
         cats = self.cfg.get("categories", [2000])

@@ -12,12 +12,13 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator, Optional
+from urllib.parse import urljoin
 
 from . import library
 from .config import parse_duration, search_interval
 from .notify import Notifier
 from .qbit import ERROR_STATES, QbitClient, QbitError, is_complete
-from .releases import Evaluation, SearchResult, WantedMovie, parse_wanted_line, rank
+from .releases import Evaluation, SearchResult, WantedMovie, display_name, parse_wanted_line, rank
 from .sources import Source, build_sources, make_session
 from .state import COMPLETED, DOWNLOADING, GAVE_UP, WANTED, State, now_iso, parse_iso
 
@@ -29,11 +30,20 @@ _MAGNET_HASH_RE = re.compile(r"urn:btih:([0-9a-fA-F]{40})")
 def human_size(n: Optional[int]) -> str:
     if not n:
         return "unknown size"
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if n < 1024 or unit == "TB":
-            return f"{n:.1f} {unit}" if unit != "B" else f"{n} B"
-        n /= 1024
-    return str(n)
+    if n < 1024:
+        return f"{n} B"
+    size = float(n)
+    for unit in ("KB", "MB", "GB"):
+        size /= 1024
+        if size < 1024:
+            return f"{size:.1f} {unit}"
+    return f"{size / 1024:.1f} TB"
+
+
+def magnet_hash(magnet: Optional[str]) -> Optional[str]:
+    """Lower-case hex info hash from a magnet link, if it has one."""
+    m = _MAGNET_HASH_RE.search(magnet or "")
+    return m.group(1).lower() if m else None
 
 
 def read_movies_file(path: str) -> list[WantedMovie]:
@@ -149,19 +159,14 @@ class Engine:
     def _grab(self, row: sqlite3.Row, movie: WantedMovie, res: SearchResult) -> None:
         tag = f"mg-{row['id']}"
         tags = [t for t in (self.cfg["qbittorrent"].get("tag"), tag) if t]
-        info_hash = res.info_hash
+        magnet, data = (res.magnet, None) if res.magnet else self._fetch_torrent(res.torrent_url)
+        info_hash = res.info_hash or magnet_hash(magnet)
 
         try:
-            if res.magnet:
-                self.qbit.add(url=res.magnet, tags=tags)
+            if magnet:
+                self.qbit.add(url=magnet, tags=tags)
             else:
-                magnet, data = self._fetch_torrent(res.torrent_url)
-                if magnet:
-                    m = _MAGNET_HASH_RE.search(magnet)
-                    info_hash = info_hash or (m.group(1).lower() if m else None)
-                    self.qbit.add(url=magnet, tags=tags)
-                else:
-                    self.qbit.add(torrent_bytes=data, tags=tags, name=f"{tag}.torrent")
+                self.qbit.add(torrent_bytes=data, tags=tags, name=f"{tag}.torrent")
         except QbitError:
             # Maybe it's already in qBittorrent (added by hand): adopt it.
             existing = self.qbit.find(info_hash=info_hash) if info_hash else None
@@ -185,13 +190,13 @@ class Engine:
         """Download a .torrent ourselves; Jackett/Prowlarr links sometimes redirect to a magnet."""
         for _ in range(5):
             r = self.http.get(url, allow_redirects=False, timeout=float(self.cfg["http"]["timeout"]))
-            if r.is_redirect or r.status_code in (301, 302, 303, 307, 308):
-                url = r.headers.get("Location", "")
-                if url.startswith("magnet:"):
-                    return url, None
-                continue
-            r.raise_for_status()
-            return None, r.content
+            if not r.is_redirect:
+                r.raise_for_status()
+                return None, r.content
+            location = r.headers["Location"]
+            if location.startswith("magnet:"):
+                return location, None
+            url = urljoin(url, location)  # Location may be relative
         raise RuntimeError("Too many redirects fetching torrent")
 
     # ---------------------------------------------------------- downloading
@@ -203,7 +208,7 @@ class Engine:
         now = datetime.now(timezone.utc)
 
         for row in rows:
-            name = f"{row['title']} ({row['year']})" if row["year"] else row["title"]
+            name = display_name(row["title"], row["year"])
             added = parse_iso(row["added_at"]) or now
             try:
                 t = self.qbit.find(info_hash=row["info_hash"], tag=f"mg-{row['id']}")

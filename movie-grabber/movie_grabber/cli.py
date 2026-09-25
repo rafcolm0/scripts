@@ -19,8 +19,8 @@ from logging.handlers import RotatingFileHandler
 
 from .config import ConfigError, load_config
 from .engine import Engine, human_size
-from .releases import WantedMovie, parse_wanted_line
-from .state import WANTED
+from .releases import WantedMovie, display_name, parse_wanted_line
+from .state import COMPLETED, WANTED
 
 DEFAULT_CONFIG = os.environ.get("MOVIE_GRABBER_CONFIG", "~/.config/movie-grabber/config.yaml")
 
@@ -71,9 +71,9 @@ def cmd_status(engine: Engine, _args) -> int:
         print("No titles yet. Add some to", engine.cfg["movies_file"])
         return 0
     for r in rows:
-        name = f"{r['title']} ({r['year']})" if r["year"] else r["title"]
+        name = display_name(r["title"], r["year"])
         detail = r["release_name"] or ""
-        if r["status"] == "completed" and r["dest_path"]:
+        if r["status"] == COMPLETED and r["dest_path"]:
             detail = r["dest_path"]
         if r["error"]:
             detail += f"  [!] {r['error']}"
@@ -89,8 +89,10 @@ def cmd_reset(engine: Engine, args) -> int:
     if not row:
         print(f"{movie.display} is not tracked yet.")
         return 1
-    engine.state.update(row["id"], status=WANTED, attempts=0, error=None, info_hash=None,
-                        **({"rejected": "[]"} if args.clear_blacklist else {}))
+    fields = {"status": WANTED, "attempts": 0, "error": None, "info_hash": None}
+    if args.clear_blacklist:
+        fields["rejected"] = "[]"
+    engine.state.update(row["id"], **fields)
     print(f"{movie.display} is wanted again.")
     return 0
 

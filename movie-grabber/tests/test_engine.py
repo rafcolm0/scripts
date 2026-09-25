@@ -69,6 +69,29 @@ class FakeNotifier:
         return True
 
 
+class FakeResponse:
+    def __init__(self, location=None, content=b""):
+        self.is_redirect = location is not None
+        self.status_code = 302 if self.is_redirect else 200
+        self.headers = {"Location": location} if location else {}
+        self.content = content
+
+    def raise_for_status(self):
+        pass
+
+
+class FakeHttp:
+    """Stands in for engine.http: returns canned responses and records requested URLs."""
+
+    def __init__(self, *responses):
+        self.responses = list(responses)
+        self.urls = []
+
+    def get(self, url, **kw):
+        self.urls.append(url)
+        return self.responses.pop(0)
+
+
 class EngineTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -168,6 +191,25 @@ class EngineTests(unittest.TestCase):
         self.engine.run_once()
         self.assertEqual(self.engine.state.all()[0]["status"], "completed")
         self.assertEqual(self.source.calls, 0)
+
+    def test_fetch_torrent_follows_relative_redirects(self):
+        self.engine.http = FakeHttp(FakeResponse(location="/dl/heat.torrent"), FakeResponse(content=b"d4:infoe"))
+        self.assertEqual(self.engine._fetch_torrent("http://localhost:9117/api/dl?id=1"), (None, b"d4:infoe"))
+        self.assertEqual(self.engine.http.urls[1], "http://localhost:9117/dl/heat.torrent")
+
+    def test_torrent_link_redirecting_to_magnet_records_hash(self):
+        self.source.results = [SearchResult("Heat.1995.1080p.BluRay.x264-YIFY", "fake", 80, 2 * 1024 ** 3,
+                                            torrent_url="http://localhost:9117/dl/abc")]
+        self.engine.http = FakeHttp(FakeResponse(location=f"magnet:?xt=urn:btih:{HASH.upper()}"))
+        self.engine.run_once()
+        row = self.engine.state.all()[0]
+        self.assertEqual((row["status"], row["info_hash"]), ("downloading", HASH))
+
+    def test_magnet_without_info_hash_records_hash(self):
+        self.source.results = [SearchResult("Heat.1995.1080p.BluRay.x264-YIFY", "fake", 80, 2 * 1024 ** 3,
+                                            magnet=f"magnet:?xt=urn:btih:{HASH}&dn=Heat")]
+        self.engine.run_once()
+        self.assertEqual(self.engine.state.all()[0]["info_hash"], HASH)
 
 
 class TorznabParseTests(unittest.TestCase):

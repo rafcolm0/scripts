@@ -10,6 +10,8 @@ from typing import Any
 
 import yaml
 
+from . import __version__
+
 DEFAULTS: dict[str, Any] = {
     "movies_file": "movies.txt",
     "state_db": "movie-grabber.db",
@@ -93,12 +95,14 @@ DEFAULTS: dict[str, Any] = {
     },
     "http": {
         "timeout": 30,
-        "user_agent": "Mozilla/5.0 (X11; Ubuntu; Linux x86_64) movie-grabber/1.0",
+        "user_agent": f"Mozilla/5.0 (X11; Ubuntu; Linux x86_64) movie-grabber/{__version__}",
     },
 }
 
 _DURATION_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([smhdw]?)\s*$", re.I)
 _UNITS = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+# Mappings the user's config replaces as a whole instead of merging key by key.
+_REPLACED_KEYS = {"path_map", "roots"}
 
 
 class ConfigError(Exception):
@@ -118,7 +122,7 @@ def parse_duration(value: Any) -> float:
 def _deep_merge(base: dict, override: dict) -> dict:
     out = copy.deepcopy(base)
     for key, val in (override or {}).items():
-        if isinstance(val, dict) and isinstance(out.get(key), dict) and key != "path_map" and key != "roots":
+        if isinstance(val, dict) and isinstance(out.get(key), dict) and key not in _REPLACED_KEYS:
             out[key] = _deep_merge(out[key], val)
         else:
             out[key] = val
